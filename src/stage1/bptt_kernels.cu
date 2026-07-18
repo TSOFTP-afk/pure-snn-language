@@ -69,6 +69,13 @@ __global__ void synapse_forward_kernel(
     I_out[i] = sum;
 }
 
+// Add constant bias: I[i] += bias[i]
+__global__ void add_bias_kernel(float* I, const float* bias, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    I[i] += bias[i];
+}
+
 // Backward main step.
 //   v_grad[i]             = dL_dV[i] * beta * (1 - S_prev[i])
 //   s_grad_via_V_reset[i] = dL_dV[i] * (-beta * V_prev[i])

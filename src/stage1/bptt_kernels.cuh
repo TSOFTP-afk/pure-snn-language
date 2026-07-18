@@ -15,6 +15,9 @@ __global__ void synapse_forward_kernel(
     float* I_out, const float* W, const float* S_prev, int N
 );
 
+// Add constant bias to current: I[i] += bias[i]
+__global__ void add_bias_kernel(float* I, const float* bias, int N);
+
 // Backward main step: accumulate dL/dW and compute V-channel gradient for previous step.
 //   Inputs:
 //     dL_dV[i]   = dL/dV[t+1, i]_total  (full gradient at current step)

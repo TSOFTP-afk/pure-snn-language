@@ -88,7 +88,11 @@ float run_forward(BPTTNetwork& net, const float* h_target, bool use_smooth) {
         );
         cudaDeviceSynchronize();
 
-        // simplified: assume I_ext = 0 (gradient check task needs no external input)
+        // add external input (constant per-step bias, does not participate in gradient)
+        if (net.d_I_ext != nullptr) {
+            add_bias_kernel<<<blocks, threads>>>(I_curr, net.d_I_ext, N);
+            cudaDeviceSynchronize();
+        }
 
         smooth_forward_step_kernel<<<blocks, threads>>>(
             V_curr, S_curr, V_prev, S_prev, I_curr,
@@ -212,15 +216,24 @@ static double run_forward_double(BPTTNetwork& net, const float* h_target) {
     std::vector<double> h_W(N * N);
     for (int i = 0; i < N * N; i++) h_W[i] = h_W_float[i];
 
+    // fetch I_ext if present (constant per-step bias)
+    std::vector<double> h_I_ext(N, 0.0);
+    if (net.d_I_ext != nullptr) {
+        std::vector<float> h_I_ext_float(N);
+        cuda_check(cudaMemcpy(h_I_ext_float.data(), net.d_I_ext, N * sizeof(float),
+                              cudaMemcpyDeviceToHost), "copy I_ext (double fwd)");
+        for (int i = 0; i < N; i++) h_I_ext[i] = h_I_ext_float[i];
+    }
+
     std::vector<double> V_prev(N, 0.0), S_prev(N, 0.0);
     std::vector<double> V_curr(N), S_curr(N), I(N);
 
     for (int t = 0; t < T; t++) {
-        // I[i] = sum_j W[i, j] * S_prev[j]
+        // I[i] = sum_j W[i, j] * S_prev[j] + I_ext[i]
         for (int i = 0; i < N; i++) {
             double sum = 0.0;
             for (int j = 0; j < N; j++) sum += h_W[i * N + j] * S_prev[j];
-            I[i] = sum;
+            I[i] = sum + h_I_ext[i];
         }
         // V[i] = beta * V_prev[i] * (1 - S_prev[i]) + I[i]
         // S[i] = sigmoid(alpha * (V[i] - theta))
@@ -307,6 +320,14 @@ bool gradient_check(BPTTNetwork& net, const float* h_target, float epsilon = 1e-
 
 // =============================================================================
 // Minimal learning demo: SGD-train the network to track a target spike pattern
+//
+// Surrogate gradient training (standard SNN approach):
+//   - Forward uses REAL spikes (use_smooth=false) so the saved V/S history
+//     reflects what the network actually does at inference time.
+//   - Backward uses the SMOOTH surrogate gradient sigma'(alpha*(V-theta))
+//     to approximate dS/dV (which is a Dirac for real spikes).
+//   This combination lets gradient flow through real spike patterns while
+//   keeping the loss differentiable.
 // =============================================================================
 void train_demo(BPTTNetwork& net) {
     int N = net.N, T = net.T;
@@ -316,17 +337,16 @@ void train_demo(BPTTNetwork& net) {
     for (int i = 0; i < 5; i++) h_target[i] = 1.0f;
     for (int i = 5; i < N; i++) h_target[i] = 0.0f;
 
-    printf("\n=== Training demo (target: first 5 fire, last 5 silent) ===\n");
-    printf("Initial loss: %f\n", run_forward(net, h_target.data(), false));
+    printf("\n=== Training demo (surrogate gradient, target: first 5 fire, last 5 silent) ===\n");
+    printf("Initial real_loss: %f\n", run_forward(net, h_target.data(), false));
 
-    float lr = 0.1f;
+    float lr = 0.05f;
     int n_epochs = 200;
-    int threads = 256, blocks = (N + threads - 1) / threads;
 
     for (int epoch = 0; epoch < n_epochs; epoch++) {
-        // forward (smooth, for backward)
-        run_forward(net, h_target.data(), true);
-        // backward
+        // forward with REAL spikes (saves V/S history for backward)
+        run_forward(net, h_target.data(), false);
+        // backward with smooth surrogate gradient
         run_backward(net, h_target.data());
         // SGD update
         sgd_update_kernel<<<(N * N + 255) / 256, 256>>>(
@@ -334,11 +354,9 @@ void train_demo(BPTTNetwork& net) {
         );
         cudaDeviceSynchronize();
 
-        if (epoch % 50 == 0 || epoch == n_epochs - 1) {
-            // evaluate loss with real spikes
+        if (epoch % 20 == 0 || epoch == n_epochs - 1) {
             float real_loss = run_forward(net, h_target.data(), false);
-            printf("Epoch %3d: smooth_loss=%f, real_loss=%f\n",
-                   epoch, run_forward(net, h_target.data(), true), real_loss);
+            printf("Epoch %3d: real_loss=%f\n", epoch, real_loss);
         }
     }
 
@@ -366,6 +384,7 @@ void run_bptt_demo() {
     net.beta = 0.95f;
     net.threshold = 1.0f;
     net.surrogate_alpha = 5.0f;  // steepness, larger -> closer to real step
+    net.d_I_ext = nullptr;       // disabled by default (gradient check uses pure W dynamics)
 
     int N = net.N, T = net.T;
 
@@ -386,7 +405,7 @@ void run_bptt_demo() {
     cuda_check(cudaMemcpy(net.d_W, h_W.data(), N * N * sizeof(float),
                           cudaMemcpyHostToDevice), "init W");
 
-    // gradient check
+    // gradient check (without I_ext, pure W dynamics)
     std::vector<float> h_target(N);
     for (int i = 0; i < N; i++) h_target[i] = (i < 5) ? 1.0f : 0.0f;
     bool grad_ok = gradient_check(net, h_target.data());
@@ -399,6 +418,18 @@ void run_bptt_demo() {
         }
         cuda_check(cudaMemcpy(net.d_W, h_W.data(), N * N * sizeof(float),
                               cudaMemcpyHostToDevice), "reinit W");
+
+        // enable constant external input so network can bootstrap spiking
+        // (without I_ext, V stays 0 because I = W*S and S starts at 0)
+        std::vector<float> h_I_ext(N);
+        for (int i = 0; i < N; i++) {
+            // gentle bias to all neurons: enough to drive V toward threshold
+            h_I_ext[i] = 0.3f;
+        }
+        cuda_check(cudaMalloc(&net.d_I_ext, N * sizeof(float)), "malloc I_ext");
+        cuda_check(cudaMemcpy(net.d_I_ext, h_I_ext.data(), N * sizeof(float),
+                              cudaMemcpyHostToDevice), "init I_ext");
+
         train_demo(net);
     } else {
         printf("\n[WARN] Gradient check failed, skipping training demo. Check BPTT implementation.\n");
@@ -411,4 +442,5 @@ void run_bptt_demo() {
     cudaFree(net.d_I_history);
     cudaFree(net.d_dL_dW);
     cudaFree(net.d_dL_dV);
+    if (net.d_I_ext != nullptr) cudaFree(net.d_I_ext);
 }
