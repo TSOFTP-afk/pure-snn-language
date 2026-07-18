@@ -4,6 +4,8 @@
 
 # 构建产物
 src/build/
+src/stage1/build/
+src/stage1/nvcc_test/
 *.exe
 *.obj
 *.lib
