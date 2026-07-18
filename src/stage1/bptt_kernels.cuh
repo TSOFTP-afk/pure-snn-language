@@ -44,13 +44,16 @@ __global__ void compute_grad_S_prev_kernel(
 );
 
 // Combine V-channel and S-channel (both via-W and via-V-reset) into dL/dV[t]_total.
-//   dL/dV[t, i] = v_grad[i] + (dL_dS_via_W[i] + s_grad_via_V_reset[i]) * dS/dV
+//   dL/dV[t, i] = v_grad[i] + (dL_dS_via_W[i] + s_grad_via_V_reset[i] + dL_dS_direct[i]) * dS/dV
 // where dS/dV = alpha * sigma(x) * (1 - sigma(x)),  x = alpha * (V[t, i] - theta).
+// dL_dS_direct[i] is the per-step direct loss gradient at time t (e.g. for rate-based
+// loss: dL_dS_direct = (rate - target) / T). May be nullptr to disable.
 __global__ void combine_final_grad_kernel(
     float* dL_dV_out,
     const float* v_grad,
     const float* dL_dS_via_W,
     const float* s_grad_via_V_reset,
+    const float* dL_dS_direct,
     const float* V_prev,         // V[t]
     int N, float threshold, float surrogate_alpha
 );

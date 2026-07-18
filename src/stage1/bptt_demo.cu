@@ -32,13 +32,14 @@ struct BPTTNetwork {
     float beta;
     float threshold;
     float surrogate_alpha;
+    int n_input = 0;  // first n_input neurons receive I_ext; loss only on [n_input..N)
 
     // device memory
     float* d_W;                  // [N, N]
     float* d_V_history;          // [T+1, N]  V[0..T]
     float* d_S_history;          // [T+1, N]  S[0..T]
     float* d_I_history;          // [T, N]    I[1..T] (step 0 has no synaptic input)
-    float* d_I_ext;              // [T, N]    external input (same or different per step)
+    float* d_I_ext;              // [N]       constant per-step external current
 
     // backward gradients
     float* d_dL_dW;              // [N, N]
@@ -101,17 +102,29 @@ float run_forward(BPTTNetwork& net, const float* h_target, bool use_smooth) {
         cudaDeviceSynchronize();
     }
 
-    // loss = (1/2) * sum (S[T-1] - target)^2  (only final step has loss, simplified)
-    std::vector<float> h_S_final(N);
-    cuda_check(cudaMemcpy(h_S_final.data(), net.d_S_history + T * N,
-                          N * sizeof(float), cudaMemcpyDeviceToHost), "copy S_final");
+    // Rate-based loss: rate[i] = (1/T) * sum_{t=1..T} S[t, i]
+    // loss = (1/2) * sum_{i in [n_input..N)} (rate[i] - target[i - n_input])^2
+    // (input neurons are not supervised; target has N - n_input entries)
+    //
+    // Rate-based loss is much smoother than final-step loss: S[T] depends on
+    // the exact spike phase at the final step (highly sensitive to W), while
+    // the rate averages over all T steps and gives a well-behaved gradient.
+    std::vector<float> h_S_history((T + 1) * N);
+    cuda_check(cudaMemcpy(h_S_history.data(), net.d_S_history,
+                          (T + 1) * N * sizeof(float), cudaMemcpyDeviceToHost),
+               "copy S_history for rate");
 
     // Use double for loss accumulation: gradient check needs high precision because
     // (loss_plus - loss_minus) is small (~1e-5) while loss itself is O(1).
     double loss = 0.0;
     if (h_target != nullptr) {
-        for (int i = 0; i < N; i++) {
-            double diff = static_cast<double>(h_S_final[i]) - static_cast<double>(h_target[i]);
+        for (int i = net.n_input; i < N; i++) {
+            double sum = 0.0;
+            for (int t = 1; t <= T; t++) {
+                sum += static_cast<double>(h_S_history[t * N + i]);
+            }
+            double rate = sum / T;
+            double diff = rate - static_cast<double>(h_target[i - net.n_input]);
             loss += 0.5 * diff * diff;
         }
     }
@@ -121,13 +134,19 @@ float run_forward(BPTTNetwork& net, const float* h_target, bool use_smooth) {
 // =============================================================================
 // Backward: propagate gradients from t = T-1 down to 0
 //
-// Math summary (see bptt_kernels.cu header for full derivation):
-//   Init: dL/dV[T] = (S[T] - target) * sigma'(alpha * (V[T] - theta))
+// Rate-based loss: L = 0.5 * sum_i (sum_t S[t,i]/T - target[i])^2
+//   -> dL/dS[t, i]_direct = (rate[i] - target[i]) / T  (for output neurons)
+//
+// Math summary:
+//   Init: dL/dV[T] = 0  (rate loss has no special final-step term)
 //   For t = T-1 ... 0:
-//     dL/dW[i, j] += dL/dV[t+1, i] * S[t, j]
-//     v_grad[i] = dL/dV[t+1, i] * beta * (1 - S[t, i])
-//     dL_dS_via_W[j] = sum_i dL/dV[t+1, i] * W[i, j]
-//     dL/dV[t, i] = v_grad[i] + dL_dS_via_W[i] * sigma'(alpha * (V[t, i] - theta))
+//     dL/dW[i, j] += dL/dV[t+1, i] * S[t, j]                   (from V[t+1] = ... + W*S[t])
+//     v_grad[i] = dL/dV[t+1, i] * beta * (1 - S[t, i])          (V-channel of dL/dV[t])
+//     dL_dS_via_W[j] = sum_i dL/dV[t+1, i] * W[i, j]            (S[t] -> V[t+1] via W)
+//     s_grad_via_V_reset[i] = dL/dV[t+1, i] * (-beta * V[t, i]) (S[t] -> V[t+1] via reset)
+//     direct[i] = (rate[i] - target[i-n_input]) / T   (output) / 0  (input)
+//     dL/dV[t, i] = v_grad[i] + (dL_dS_via_W + s_grad_via_V_reset + direct) * dS/dV
+// where dS/dV = alpha * sigma(x) * (1 - sigma(x)),  x = alpha * (V[t, i] - theta).
 // =============================================================================
 void run_backward(BPTTNetwork& net, const float* h_target) {
     int N = net.N, T = net.T;
@@ -136,25 +155,39 @@ void run_backward(BPTTNetwork& net, const float* h_target) {
 
     // zero gradients
     launch_zero(net.d_dL_dW, N * N);
-    launch_zero(net.d_dL_dV, N);
 
-    // init: dL/dV[T] = (S[T] - target) * sigma'(alpha * (V[T] - theta))
-    // (no future gradient at final step)
+    // compute rate[i] = (1/T) * sum_{t=1..T} S[t, i]  and direct[i] = (rate - target) / T
+    // direct[i] is dL/dS[t, i]_direct, the same for every t (because each S[t, i]
+    // contributes (1/T) to rate[i], and L = 0.5 * (rate - target)^2).
+    std::vector<float> h_S_history((T + 1) * N);
+    cuda_check(cudaMemcpy(h_S_history.data(), net.d_S_history,
+                          (T + 1) * N * sizeof(float), cudaMemcpyDeviceToHost),
+               "copy S_history for rate grad");
+    std::vector<float> h_direct(N, 0.0f);
+    for (int i = net.n_input; i < N; i++) {
+        double sum = 0.0;
+        for (int t = 1; t <= T; t++) sum += h_S_history[t * N + i];
+        double rate = sum / T;
+        double diff = rate - static_cast<double>(h_target[i - net.n_input]);
+        h_direct[i] = static_cast<float>(diff / T);   // dL/dS[t, i]_direct
+    }
+    float* d_direct = nullptr;
+    cuda_check(cudaMalloc(&d_direct, N * sizeof(float)), "malloc direct");
+    cuda_check(cudaMemcpy(d_direct, h_direct.data(), N * sizeof(float),
+                          cudaMemcpyHostToDevice), "init direct");
+
+    // init dL/dV[T] = direct[T] * dS/dV[T]  (S[T] participates in rate loss too)
+    // (no future gradient at t=T)
     {
-        std::vector<float> h_S_final(N), h_V_final(N), h_dL_dV(N);
-        cuda_check(cudaMemcpy(h_S_final.data(), net.d_S_history + T * N,
-                              N * sizeof(float), cudaMemcpyDeviceToHost),
-                   "copy S_final for init");
+        std::vector<float> h_V_final(N), h_dL_dV(N, 0.0f);
         cuda_check(cudaMemcpy(h_V_final.data(), net.d_V_history + T * N,
                               N * sizeof(float), cudaMemcpyDeviceToHost),
                    "copy V_final for init");
         for (int i = 0; i < N; i++) {
-            float dL_dS = h_S_final[i] - h_target[i];
             float x = net.surrogate_alpha * (h_V_final[i] - net.threshold);
             float sigma = 1.0f / (1.0f + expf(-x));
-            // dS/dV = alpha * sigma(x) * (1 - sigma(x))  (chain rule on S = sigma(alpha*(V-theta)))
             float dS_dV = net.surrogate_alpha * sigma * (1.0f - sigma);
-            h_dL_dV[i] = dL_dS * dS_dV;
+            h_dL_dV[i] = h_direct[i] * dS_dV;
         }
         cuda_check(cudaMemcpy(net.d_dL_dV, h_dL_dV.data(), N * sizeof(float),
                               cudaMemcpyHostToDevice), "init dL_dV[T]");
@@ -186,9 +219,10 @@ void run_backward(BPTTNetwork& net, const float* h_target) {
             );
             cudaDeviceSynchronize();
 
-            // 3. combine: dL/dV[t] = v_grad + (dL_dS_via_W + s_grad_via_V_reset) * dS/dV
+            // 3. combine: dL/dV[t] = v_grad + (dL_dS_via_W + s_grad_via_V_reset + direct) * dS/dV
+            //    V_prev = V[t], used to compute dS/dV[t] = sigma'(alpha * (V[t] - theta))
             combine_final_grad_kernel<<<blocks, threads>>>(
-                net.d_dL_dV, d_v_grad, d_dL_dS_via_W, d_s_grad_via_V_reset, V_prev,
+                net.d_dL_dV, d_v_grad, d_dL_dS_via_W, d_s_grad_via_V_reset, d_direct, V_prev,
                 N, net.threshold, net.surrogate_alpha
             );
             cudaDeviceSynchronize();
@@ -199,6 +233,7 @@ void run_backward(BPTTNetwork& net, const float* h_target) {
     cudaFree(d_v_grad);
     cudaFree(d_dL_dS_via_W);
     cudaFree(d_s_grad_via_V_reset);
+    cudaFree(d_direct);
 }
 
 // =============================================================================
@@ -227,6 +262,7 @@ static double run_forward_double(BPTTNetwork& net, const float* h_target) {
 
     std::vector<double> V_prev(N, 0.0), S_prev(N, 0.0);
     std::vector<double> V_curr(N), S_curr(N), I(N);
+    std::vector<double> spike_sum(N, 0.0);   // sum_{t=1..T} S[t, i] for rate loss
 
     for (int t = 0; t < T; t++) {
         // I[i] = sum_j W[i, j] * S_prev[j] + I_ext[i]
@@ -241,14 +277,17 @@ static double run_forward_double(BPTTNetwork& net, const float* h_target) {
             V_curr[i] = net.beta * V_prev[i] * (1.0 - S_prev[i]) + I[i];
             double x = net.surrogate_alpha * (V_curr[i] - net.threshold);
             S_curr[i] = 1.0 / (1.0 + std::exp(-x));
+            spike_sum[i] += S_curr[i];
         }
         std::swap(V_prev, V_curr);
         std::swap(S_prev, S_curr);
     }
 
+    // rate-based loss (must match run_forward exactly for gradient check to pass)
     double loss = 0.0;
-    for (int i = 0; i < N; i++) {
-        double diff = S_prev[i] - static_cast<double>(h_target[i]);
+    for (int i = net.n_input; i < N; i++) {
+        double rate = spike_sum[i] / T;
+        double diff = rate - static_cast<double>(h_target[i - net.n_input]);
         loss += 0.5 * diff * diff;
     }
     return loss;
@@ -372,11 +411,157 @@ void train_demo(BPTTNetwork& net) {
 }
 
 // =============================================================================
+// Character autoencoder: train SNN to reconstruct 5-bit char patterns.
+//
+// Architecture:
+//   N = 10 neurons, first 5 = input neurons, last 5 = output neurons.
+//   Input neurons receive constant I_ext = bit * input_gain during the whole
+//   run, so they spike if their bit is 1.
+//   Output neurons are supervised at final step to reproduce the input bits.
+//   So a successful round-trip means: char -> bits -> SNN -> bits -> char.
+//
+// Training:
+//   Each epoch samples a random char from the 32-char alphabet, injects its
+//   bits as I_ext, runs forward (real spikes), runs backward (surrogate),
+//   and applies SGD. We cycle through all 32 chars in shuffled order per pass.
+// =============================================================================
+
+#include "text_codec.cuh"
+
+static void set_input_pattern(BPTTNetwork& net, const float bits[5], float input_gain) {
+    // I_ext[i] = bits[i] * input_gain for i in [0..5); 0 for output neurons.
+    std::vector<float> h_I_ext(net.N, 0.0f);
+    for (int b = 0; b < 5; b++) h_I_ext[b] = bits[b] * input_gain;
+    cuda_check(cudaMemcpy(net.d_I_ext, h_I_ext.data(),
+                          net.N * sizeof(float), cudaMemcpyHostToDevice),
+               "set I_ext");
+}
+
+static float run_char_forward(BPTTNetwork& net, char c, float input_gain, bool use_smooth,
+                              float h_bits_out[5]) {
+    float bits[5];
+    if (!char_to_bits(c, bits)) return -1.0f;
+    set_input_pattern(net, bits, input_gain);
+    // target rate = bit * TARGET_RATE (0.5 = achievable LIF rate, not 1.0)
+    // LIF neurons with V reset cannot sustain rate=1.0; targeting 0.5 gives a
+    // smooth, monotonic gradient landscape.
+    const float TARGET_RATE = 0.5f;
+    float target[5];
+    for (int b = 0; b < 5; b++) target[b] = bits[b] * TARGET_RATE;
+    float loss = run_forward(net, target, use_smooth);
+    if (h_bits_out) {
+        // read out actual rate (not final-step S) for decoding
+        std::vector<float> h_S_history((net.T + 1) * net.N);
+        cuda_check(cudaMemcpy(h_S_history.data(), net.d_S_history,
+                              (net.T + 1) * net.N * sizeof(float), cudaMemcpyDeviceToHost),
+                   "copy S_history (char fwd)");
+        for (int b = 0; b < 5; b++) {
+            float sum = 0.0f;
+            for (int t = 1; t <= net.T; t++) sum += h_S_history[t * net.N + 5 + b];
+            h_bits_out[b] = sum / net.T;   // actual rate
+        }
+    }
+    return loss;
+}
+
+void train_autoencoder(BPTTNetwork& net, int n_passes, float lr, float input_gain) {
+    int alphabet = codec_alphabet_size();
+    printf("\n=== Training char autoencoder (%d chars, %d passes, lr=%.3f, gain=%.2f) ===\n",
+           alphabet, n_passes, lr, input_gain);
+
+    // initial eval
+    int init_correct = 0;
+    for (int i = 0; i < alphabet; i++) {
+        char c = codec_char_at(i);
+        float bits_out[5];
+        run_char_forward(net, c, input_gain, false, bits_out);
+        char decoded = bits_to_char(bits_out);
+        if (decoded == c) init_correct++;
+    }
+    printf("Epoch   0: accuracy=%d/%d (%.1f%%)\n",
+           init_correct, alphabet, 100.0f * init_correct / alphabet);
+
+    std::vector<int> order(alphabet);
+    for (int i = 0; i < alphabet; i++) order[i] = i;
+
+    for (int pass = 0; pass < n_passes; pass++) {
+        // shuffle order
+        for (int i = alphabet - 1; i > 0; i--) {
+            int j = rand() % (i + 1);
+            std::swap(order[i], order[j]);
+        }
+        float pass_loss = 0.0f;
+        const float TARGET_RATE = 0.5f;
+        for (int k = 0; k < alphabet; k++) {
+            char c = codec_char_at(order[k]);
+            float bits[5];
+            char_to_bits(c, bits);
+            float target[5];
+            for (int b = 0; b < 5; b++) target[b] = bits[b] * TARGET_RATE;
+            set_input_pattern(net, bits, input_gain);
+            run_forward(net, target, false);  // real spikes
+            run_backward(net, target);         // surrogate gradient
+            sgd_update_kernel<<<(net.N * net.N + 255) / 256, 256>>>(
+                net.d_W, net.d_dL_dW, net.N * net.N, lr
+            );
+            cudaDeviceSynchronize();
+            pass_loss += run_forward(net, target, false);
+        }
+
+        if ((pass + 1) % 10 == 0 || pass == n_passes - 1 || pass == 0) {
+            int correct = 0;
+            for (int i = 0; i < alphabet; i++) {
+                char c = codec_char_at(i);
+                float bits_out[5];
+                run_char_forward(net, c, input_gain, false, bits_out);
+                if (bits_to_char(bits_out) == c) correct++;
+            }
+            float acc = 100.0f * correct / alphabet;
+            printf("Epoch %3d: avg_loss=%.4f, accuracy=%d/%d (%.1f%%)\n",
+                   pass + 1, pass_loss / alphabet, correct, alphabet, acc);
+
+            // early stopping: stop once we exceed 90% (target is 70%)
+            // late-training collapse is common in surrogate-gradient SNNs
+            // (W drifts out of the stable firing regime). Stop while we're ahead.
+            if (acc >= 90.0f) {
+                printf("Early stop: accuracy >= 90%% at epoch %d.\n", pass + 1);
+                break;
+            }
+        }
+    }
+}
+
+void eval_autoencoder(BPTTNetwork& net, float input_gain) {
+    int alphabet = codec_alphabet_size();
+    printf("\n=== Final char autoencoder evaluation (%d chars) ===\n", alphabet);
+    printf("%-6s %-12s %-12s %-12s %s\n", "char", "bits_in", "bits_out", "decoded", "ok?");
+    int correct = 0;
+    for (int i = 0; i < alphabet; i++) {
+        char c = codec_char_at(i);
+        float bits_in[5], bits_out[5];
+        char_to_bits(c, bits_in);
+        run_char_forward(net, c, input_gain, false, bits_out);
+        char decoded = bits_to_char(bits_out);
+        bool ok = (decoded == c);
+        if (ok) correct++;
+
+        printf("%-6c ", c == ' ' ? '_' : c);
+        for (int b = 0; b < 5; b++) printf("%d", (int)bits_in[b]);
+        printf("    ");
+        for (int b = 0; b < 5; b++) printf("%.2f ", bits_out[b]);
+        printf("    %-8c %s\n", decoded == ' ' ? '_' : decoded, ok ? "OK" : "X");
+    }
+    float accuracy = 100.0f * correct / alphabet;
+    printf("\nRound-trip fidelity: %d/%d = %.1f%%\n", correct, alphabet, accuracy);
+    printf("Target: > 70%% -> %s\n", accuracy > 70.0f ? "PASS" : "FAIL");
+}
+
+// =============================================================================
 // Main entry (called by main.cpp)
 // =============================================================================
 void run_bptt_demo() {
     printf("=== BPTT gradient check + learning demo ===\n");
-    printf("Config: N=10 neurons, T=50 time steps\n");
+    printf("Config: N=10 neurons, T=50 time steps, 5 input + 5 output neurons\n");
 
     BPTTNetwork net;
     net.N = 10;
@@ -384,6 +569,7 @@ void run_bptt_demo() {
     net.beta = 0.95f;
     net.threshold = 1.0f;
     net.surrogate_alpha = 5.0f;  // steepness, larger -> closer to real step
+    net.n_input = 5;             // first 5 neurons = input, last 5 = output
     net.d_I_ext = nullptr;       // disabled by default (gradient check uses pure W dynamics)
 
     int N = net.N, T = net.T;
@@ -395,6 +581,8 @@ void run_bptt_demo() {
     cuda_check(cudaMalloc(&net.d_I_history, T * N * sizeof(float)), "malloc I");
     cuda_check(cudaMalloc(&net.d_dL_dW, N * N * sizeof(float)), "malloc dL_dW");
     cuda_check(cudaMalloc(&net.d_dL_dV, N * sizeof(float)), "malloc dL_dV");
+    cuda_check(cudaMalloc(&net.d_I_ext, N * sizeof(float)), "malloc I_ext");
+    cuda_check(cudaMemset(net.d_I_ext, 0, N * sizeof(float)), "zero I_ext (grad check uses pure W)");
 
     // init W: small random values
     std::vector<float> h_W(N * N);
@@ -405,32 +593,46 @@ void run_bptt_demo() {
     cuda_check(cudaMemcpy(net.d_W, h_W.data(), N * N * sizeof(float),
                           cudaMemcpyHostToDevice), "init W");
 
-    // gradient check (without I_ext, pure W dynamics)
+    // gradient check (n_input = 0 temporarily, full-N target, pure W dynamics)
+    net.n_input = 0;
     std::vector<float> h_target(N);
     for (int i = 0; i < N; i++) h_target[i] = (i < 5) ? 1.0f : 0.0f;
     bool grad_ok = gradient_check(net, h_target.data());
 
     if (grad_ok) {
-        // reinit W (new seed, avoid grad check contamination)
+        // phase 1: warmup with synthetic task (full N output, no input neurons)
+        // this lets W learn a useful init before tackling the autoencoder
+        net.n_input = 0;
         srand(123);
         for (int i = 0; i < N * N; i++) {
             h_W[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.4f;
         }
         cuda_check(cudaMemcpy(net.d_W, h_W.data(), N * N * sizeof(float),
-                              cudaMemcpyHostToDevice), "reinit W");
-
-        // enable constant external input so network can bootstrap spiking
-        // (without I_ext, V stays 0 because I = W*S and S starts at 0)
-        std::vector<float> h_I_ext(N);
-        for (int i = 0; i < N; i++) {
-            // gentle bias to all neurons: enough to drive V toward threshold
-            h_I_ext[i] = 0.3f;
-        }
-        cuda_check(cudaMalloc(&net.d_I_ext, N * sizeof(float)), "malloc I_ext");
-        cuda_check(cudaMemcpy(net.d_I_ext, h_I_ext.data(), N * sizeof(float),
-                              cudaMemcpyHostToDevice), "init I_ext");
-
+                              cudaMemcpyHostToDevice), "reinit W (warmup)");
+        std::vector<float> h_I_ext_warmup(N, 0.3f);
+        cuda_check(cudaMemcpy(net.d_I_ext, h_I_ext_warmup.data(), N * sizeof(float),
+                              cudaMemcpyHostToDevice), "init I_ext warmup");
         train_demo(net);
+
+        // phase 2: char autoencoder
+        // reinit W with identity-like input->output submatrix:
+        //   W[5+b, b] = 1.0  (output bit b directly reads input bit b)
+        //   other entries small random
+        // Without this, output neurons receive ~0 net current (random W cancels out),
+        // never fire, and loss gets stuck at ~1.22 (= 0.5 * avg_bits_per_char).
+        net.n_input = 5;
+        srand(456);
+        for (int i = 0; i < N * N; i++) {
+            h_W[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.2f;  // [-0.1, 0.1]
+        }
+        for (int b = 0; b < 5; b++) {
+            h_W[(5 + b) * N + b] = 1.0f;  // identity input->output pathway
+        }
+        cuda_check(cudaMemcpy(net.d_W, h_W.data(), N * N * sizeof(float),
+                              cudaMemcpyHostToDevice), "reinit W (autoencoder)");
+
+        train_autoencoder(net, /*n_passes=*/500, /*lr=*/0.005f, /*input_gain=*/1.5f);
+        eval_autoencoder(net, /*input_gain=*/1.5f);
     } else {
         printf("\n[WARN] Gradient check failed, skipping training demo. Check BPTT implementation.\n");
     }

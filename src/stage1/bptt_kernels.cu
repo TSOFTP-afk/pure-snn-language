@@ -114,13 +114,15 @@ __global__ void compute_grad_S_prev_kernel(
     dL_dS_via_W[j] = sum;
 }
 
-// Combine: dL_dV_out[i] = v_grad[i] + (dL_dS_via_W[i] + s_grad_via_V_reset[i]) * dS/dV
+// Combine: dL_dV_out[i] = v_grad[i] + (dL_dS_via_W[i] + s_grad_via_V_reset[i] + dL_dS_direct[i]) * dS/dV
 //   dS/dV = alpha * sigma(x) * (1 - sigma(x)),  x = alpha * (V_prev[i] - theta)
+//   dL_dS_direct may be nullptr (no per-step direct loss).
 __global__ void combine_final_grad_kernel(
     float* dL_dV_out,
     const float* v_grad,
     const float* dL_dS_via_W,
     const float* s_grad_via_V_reset,
+    const float* dL_dS_direct,
     const float* V_prev,
     int N, float threshold, float surrogate_alpha
 ) {
@@ -132,7 +134,8 @@ __global__ void combine_final_grad_kernel(
     // dS/dV = alpha * sigma(x) * (1 - sigma(x)),  because S = sigma(alpha*(V-theta))
     float dS_dV = surrogate_alpha * sigma * (1.0f - sigma);
 
-    float dL_dS_total = dL_dS_via_W[i] + s_grad_via_V_reset[i];
+    float direct = (dL_dS_direct != nullptr) ? dL_dS_direct[i] : 0.0f;
+    float dL_dS_total = dL_dS_via_W[i] + s_grad_via_V_reset[i] + direct;
     dL_dV_out[i] = v_grad[i] + dL_dS_total * dS_dV;
 }
 
