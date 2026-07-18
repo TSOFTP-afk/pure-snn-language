@@ -1,0 +1,66 @@
+# =============================================================================
+# SNN Dialogue - .gitignore
+# =============================================================================
+
+# 构建产物
+src/build/
+*.exe
+*.obj
+*.lib
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# CMake 临时文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.ninja
+.ninja_*
+build.ninja
+rules.ninja
+
+# CUDA 编译中间产物
+*.cubin
+*.ptx
+*.fatbin
+*.ii
+*.gpu
+
+# 训练产物（检查点权重）
+*.bin
+weights_ep*.bin
+
+# 调试期间临时测试文件（开发时产生的，不归档）
+test_*.cu
+test_*.exe
+
+# 日志
+build_log.txt
+run_log.txt
+*.log
+
+# IDE / 编辑器
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.aps
+*.VC.db
+*.VC.opendb
+
+# 操作系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Python（如果有辅助脚本）
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
