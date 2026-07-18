@@ -64,3 +64,6 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+
+# 临时文件
+COMMIT_MSG.txt
