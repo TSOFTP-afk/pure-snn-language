@@ -8,6 +8,8 @@ src/stage1/build/
 src/stage1/nvcc_test/
 src/stage2/build/
 src/stage2/nvcc_test/
+src/stage2e/build/
+src/stage2e/nvcc_test/
 *.exe
 *.obj
 *.lib
