@@ -16,7 +16,9 @@ void read_output(const bool* d_spikes, float* d_output,
                  int n_motor, int motor_start);
 
 // 统计网络状态（用于监控）
+// d_weights / n_synapses 传 nullptr/0 时跳过 mean_weight 计算（向后兼容）
 void compute_stats(const NeuronState* d_neurons, const bool* d_spikes,
-                   NetworkStats* d_stats, int n_neurons);
+                   NetworkStats* d_stats, int n_neurons,
+                   const float* d_weights = nullptr, int n_synapses = 0);
 
 #endif // SNN_IO_CUH

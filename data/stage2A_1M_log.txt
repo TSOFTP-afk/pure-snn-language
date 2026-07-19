@@ -1,0 +1,78 @@
+﻿============================================================
+  SNN Stage 2: Joint Cortex Development
+============================================================
+  steps    = 1000000
+  text     = f:\��Ŀ\THE TRUE AI\data\lccc_base.txt
+  ckpt     = f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin
+  resume   = (none)
+  quiet    = yes
+  seed     = 42
+============================================================
+
+[Network] 分配 GPU 显存...
+[Memory] 显存占用：
+  神经元状态:  234.375 KB
+  突触:        30.5176 MB
+  CSR 索引:    7.66755 MB
+  缓冲区:      56.6719 KB
+  总计:        38.4693 MB
+  6GB 显存占比: 0.626129%
+[Network] allocate_only() 完成（拓扑未生成，等待 stage2 填充）
+  神经元数: 10000
+  突触容量: 1000000
+[Stage2-Topology] Generating columnar topology:
+  neurons           = 10000
+  columns           = 10
+  neurons/column    = 1000
+  intra/neuron      = 80
+  inter/neuron      = 20
+  total synapses    = 1000000
+[Stage2-Topology] Done.
+[Stage2-Topology] Verification report:
+  total synapses    = 1000000
+  nonzero           = 1000000 (zero=0)
+  intra-column      = 800000 (expected 800000)
+  inter-column      = 200000 (expected 200000)
+  excitatory (w>0)  = 800647
+  inhibitory (w<0)  = 199353
+  mean weight       = 0.0901746
+  mean |weight|     = 0.149841
+[TextStream] Loaded f:\��Ŀ\THE TRUE AI\data\lccc_base.txt: 869334535 raw bytes -> 869334535 filtered bytes
+
+[Stage2] Starting 1000000-step training...
+[Stage2-Trainer] Starting unsupervised training:
+  start_step = 0
+  n_steps    = 1000000
+  ckpt_path  = f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin
+  text_size  = 869334535 chars
+[Stage2-Ckpt] Saved step=50001 text_pos=50001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=100001 text_pos=100001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=150001 text_pos=150001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=200001 text_pos=200001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=250001 text_pos=250001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=300001 text_pos=300001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=350001 text_pos=350001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=400001 text_pos=400001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=450001 text_pos=450001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=500001 text_pos=500001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=550001 text_pos=550001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=600001 text_pos=600001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=650001 text_pos=650001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=700001 text_pos=700001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=750001 text_pos=750001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=800001 text_pos=800001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=850001 text_pos=850001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=900001 text_pos=900001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=950001 text_pos=950001 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Ckpt] Saved step=1000000 text_pos=1000000 to f:\��Ŀ\THE TRUE AI\data\stage2A_1M_ckpt.bin (~32 MB)
+[Stage2-Trainer] Done. end_step = 1000000
+
+============================================================
+  Stage 2 training complete
+============================================================
+  total_spikes      = 1843
+  excitatory_spikes = 1464
+  inhibitory_spikes = 379
+  mean_fire_rate    = 0.173291
+  mean_weight       = 0.299588
+============================================================

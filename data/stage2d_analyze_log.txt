@@ -1,0 +1,125 @@
+﻿============================================================
+  SNN Stage 2c: Structural Analysis
+============================================================
+  label  = 2d-P0P1-100k
+  ckpt   = f:\��Ŀ\THE TRUE AI\data\stage2d_100k_ckpt.bin
+  text   = f:\��Ŀ\THE TRUE AI\data\lccc_sample_1mb.txt
+  steps  = 10000
+  csv    = f:\��Ŀ\THE TRUE AI\data\stage2d_clusters.csv
+
+[TextStream] Loaded f:\��Ŀ\THE TRUE AI\data\lccc_sample_1mb.txt: 1048576 raw bytes -> 1048576 filtered bytes
+[Network] 分配 GPU 显存...
+[Memory] 显存占用：
+  神经元状态:  234.375 KB
+  突触:        30.5176 MB
+  CSR 索引:    7.66755 MB
+  缓冲区:      56.6719 KB
+  总计:        38.4693 MB
+  6GB 显存占比: 0.626129%
+[Network] allocate_only() 完成（拓扑未生成，等待 stage2 填充）
+  神经元数: 10000
+  突触容量: 1000000
+[Stage2-Topology] Generating columnar topology:
+  neurons           = 10000
+  columns           = 10
+  neurons/column    = 1000
+  intra/neuron      = 80
+  inter/neuron      = 20
+  total synapses    = 1000000
+[Stage2-Topology] Done.
+[Stage2-Ckpt] Loaded step=100000 text_pos=100000 from f:\��Ŀ\THE TRUE AI\data\stage2d_100k_ckpt.bin
+[Analyze] Loaded checkpoint at step 100000
+
+=== Collecting activation data ===
+[Analyzer] Collecting activation data over 10000 steps...
+  step 1000/10000 total_spikes=2429370
+  step 2000/10000 total_spikes=4859565
+  step 3000/10000 total_spikes=7293300
+  step 4000/10000 total_spikes=9725370
+  step 5000/10000 total_spikes=12155565
+  step 6000/10000 total_spikes=14589300
+  step 7000/10000 total_spikes=17021370
+  step 8000/10000 total_spikes=19451565
+  step 9000/10000 total_spikes=21885300
+
+[Analyzer] Done. total_spikes=24314868 (avg 2431.49 spikes/step)
+
+=== Power-law analysis ===
+
+=== Chi-square test ===
+
+=== PCA + K-means clustering ===
+  K=5 silhouette=0.995201
+  K=8 silhouette=0.997283
+  K=10 silhouette=0.998261
+  K=12 silhouette=0.998268
+  K=15 silhouette=0.997814
+  K=20 silhouette=0.998839
+
+=== Weight distribution ===
+
+============================================================
+  Analysis Report: 2d-P0P1-100k
+============================================================
+
+--- Activation Summary ---
+  total_steps      = 10000
+  total_spikes     = 24314868
+  avg spikes/step  = 2431.49
+  active neurons   = 7313 / 10000 (73.13%)
+  silent neurons   = 2687
+
+--- Power-law Analysis ---
+  alpha (exponent) = 0.273438
+  R^2              = 0.0838585
+  mean spike count = 3324.88
+  median count     = 3333
+  min/max count    = 1 / 3334
+  verdict          = NOT power-law
+
+--- Chi-square Test (byte-neuron independence) ---
+  neurons tested   = 7297
+  degrees of free  = 88
+  mean chi2        = 49.1185
+  max chi2         = 57.6326
+  significant      = 0 / 7297 (0%)
+  verdict          = not significant
+
+--- PCA + K-means Clustering ---
+  variance explained (top 2 PCs) = 99.8621%
+  best K          = 20
+  silhouette      = 0.998839
+  verdict         = CLUSTERS EMERGED (silhouette>0.3, 5<=K<=20)
+  cluster sizes   = 2439 2694 483 4138 27 6 29 1 1 4 2 2 2 1 17 139 1 1 12 1 
+
+--- Weight Distribution ---
+  mean            = 0.319054
+  std_dev         = 0.588435
+  min/max         = -1 / 1
+  fraction pos    = 54.0038% (excitatory)
+  fraction zero   = 32.7075%
+  fraction sat    = 43.2366% (|w|>0.9*W_MAX)
+  histogram (-1..+1, 20 bins):
+    [-1, -0.9): 65909
+    [-0.9, -0.8): 474
+    [-0.8, -0.7): 609
+    [-0.7, -0.6): 280
+    [-0.6, -0.5): 146
+    [-0.5, -0.4): 201
+    [-0.4, -0.3): 573
+    [-0.3, -0.2): 19403
+    [-0.2, -0.1): 19007
+    [-0.1, 2.77556e-17): 26285
+    [0, 0.1): 439395
+    [0.1, 0.2): 5583
+    [0.2, 0.3): 23132
+    [0.3, 0.4): 3925
+    [0.4, 0.5): 1429
+    [0.5, 0.6): 1208
+    [0.6, 0.7): 5808
+    [0.7, 0.8): 19377
+    [0.8, 0.9): 799
+    [0.9, 1): 366457
+
+============================================================
+[Analyzer] Saved 10000 points to f:\��Ŀ\THE TRUE AI\data\stage2d_clusters.csv

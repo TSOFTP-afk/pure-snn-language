@@ -49,4 +49,37 @@
 #define CUDA_CHECK(call) do { cudaError_t err = call; if (err != cudaSuccess) { fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err)); exit(EXIT_FAILURE); } } while(0)
 #define CUDA_CHECK_LAST() do { cudaError_t err = cudaGetLastError(); if (err != cudaSuccess) { fprintf(stderr, "CUDA Kernel Error: %s\n", cudaGetErrorString(err)); exit(EXIT_FAILURE); } } while(0)
 
+// =============================================================================
+// Stage 2 overrides (active only when SNN_STAGE2_BUILD is defined)
+// =============================================================================
+// 2c analysis revealed that the default homeostatic settings (target_fr=5Hz,
+// LR=0.05, max_offset=2.0) over-stabilize firing: all active neurons converge
+// to spike counts within 3 of each other (relative diff 0.09%), erasing any
+// byte-neuron selectivity (chi-square: 0/7857 neurons significant).
+//
+// 2d v1 (P0): relaxed to target_fr=15Hz, LR=0.02, max_offset=0.5.
+//   - 100k steps: spike count range expanded to 3333 (success!)
+//   - 1M steps: range collapsed back to 3 (homeostatic re-dominated)
+//   Diagnosis: threshold_offset accumulates to ±0.5 over long training,
+//   which is still strong enough to clamp firing to target_fr.
+//
+// 2d v2 (P0 re-tune): near-disable homeostatic so STDP fully dominates.
+//   - LR=0.005 (4x slower than v1, 10x slower than 2c default)
+//   - MAX_OFFSET=0.1 (5x smaller than v1, 20x smaller than 2c default)
+//     At max_offset=0.1, threshold only shifts by 0.1/16=0.00625 ~= 0.6%
+//     of base threshold -- effectively a residual slow drift corrector,
+//     not a fast firing-rate equalizer.
+//   - Keep target_fr=15Hz so drift correction targets a reasonable rate.
+// =============================================================================
+#ifdef SNN_STAGE2_BUILD
+  #undef HOMEOSTATIC_TARGET_RATE_SENSORY
+  #undef HOMEOSTATIC_TARGET_RATE_ASSOCIATION
+  #undef HOMEOSTATIC_LR
+  #undef HOMEOSTATIC_MAX_OFFSET
+  #define HOMEOSTATIC_TARGET_RATE_SENSORY     0.015f   // 15Hz (was 5Hz)
+  #define HOMEOSTATIC_TARGET_RATE_ASSOCIATION 0.015f   // 15Hz (was 5Hz)
+  #define HOMEOSTATIC_LR                      0.005f   // v2: was 0.02 (5x slower)
+  #define HOMEOSTATIC_MAX_OFFSET              0.1f     // v2: was 0.5 (5x smaller)
+#endif
+
 #endif

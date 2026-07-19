@@ -84,38 +84,116 @@ struct NetworkStats {
 // =============================================================================
 // 辅助函数：脑区偏移
 // =============================================================================
-__host__ __device__ inline int region_start(BrainRegion region) {
+// Stage 2 (方案 A)：柱内三层流水线布局。
+//   每柱 1000 神经元 = 200 sensory + 600 association + 200 motor
+//   柱 c 的 sensory 层:    [c*1000,       c*1000 + 200)
+//   柱 c 的 association 层: [c*1000 + 200, c*1000 + 800)
+//   柱 c 的 motor 层:       [c*1000 + 800, c*1000 + 1000)
+//
+// Stage 0 默认仍是全局脑区划分（sensory 在前，association 中间，motor 末尾）。
+// 用 #ifdef SNN_STAGE2_BUILD 切换，stage0 编译路径完全不变。
+// =============================================================================
+#ifdef SNN_STAGE2_BUILD
+  // Stage 2 方案 A: 柱内分层
+  // 这两个常量必须与 stage2/config.h 的 COL_SENSORY_SIZE / COL_ASSOCIATION_SIZE 一致
+  #ifndef STAGE2_COL_SENSORY_SIZE
+    #define STAGE2_COL_SENSORY_SIZE      200
+  #endif
+  #ifndef STAGE2_COL_ASSOCIATION_SIZE
+    #define STAGE2_COL_ASSOCIATION_SIZE  600
+  #endif
+  #ifndef STAGE2_NEURONS_PER_COLUMN
+    #define STAGE2_NEURONS_PER_COLUMN    1000
+  #endif
+
+  __host__ __device__ inline int region_start(BrainRegion region) {
+    // 方案 A 下脑区不再是连续段，region_start 失去意义。
+    // 返回 0 保持接口兼容（stage0 kernel 只在划分逻辑里调用，且 stage2 编译时
+    // 不会用 region_start 来定位——改用 get_region + 柱内偏移）。
+    (void)region;
+    return 0;
+  }
+
+  __host__ __device__ inline int region_size(BrainRegion region) {
+    // 方案 A: 每柱内 sensory=200, association=600, motor=200
+    // 全局总数仍是 2000/6000/2000，与 stage0 一致
     switch (region) {
-        case BrainRegion::SENSORY:     return 0;
-        case BrainRegion::ASSOCIATION: return N_SENSORY_NEURONS;
-        case BrainRegion::MOTOR:       return N_SENSORY_NEURONS + N_ASSOCIATION_NEURONS;
+        case BrainRegion::SENSORY:     return N_SENSORY_NEURONS;     // 2000
+        case BrainRegion::ASSOCIATION: return N_ASSOCIATION_NEURONS; // 6000
+        case BrainRegion::MOTOR:       return N_MOTOR_NEURONS;       // 2000
         default:                       return 0;
     }
-}
+  }
 
-__host__ __device__ inline int region_size(BrainRegion region) {
-    switch (region) {
-        case BrainRegion::SENSORY:     return N_SENSORY_NEURONS;
-        case BrainRegion::ASSOCIATION: return N_ASSOCIATION_NEURONS;
-        case BrainRegion::MOTOR:       return N_MOTOR_NEURONS;
-        default:                       return 0;
-    }
-}
+  // 方案 A: 根据柱内偏移判断脑区
+  __host__ __device__ inline BrainRegion get_region(int idx) {
+      int off = idx % STAGE2_NEURONS_PER_COLUMN;  // 柱内偏移 0..999
+      if (off < STAGE2_COL_SENSORY_SIZE) {
+          return BrainRegion::SENSORY;
+      } else if (off < STAGE2_COL_SENSORY_SIZE + STAGE2_COL_ASSOCIATION_SIZE) {
+          return BrainRegion::ASSOCIATION;
+      } else {
+          return BrainRegion::MOTOR;
+      }
+  }
+#else
+  // Stage 0 默认: 全局脑区划分
+  __host__ __device__ inline int region_start(BrainRegion region) {
+      switch (region) {
+          case BrainRegion::SENSORY:     return 0;
+          case BrainRegion::ASSOCIATION: return N_SENSORY_NEURONS;
+          case BrainRegion::MOTOR:       return N_SENSORY_NEURONS + N_ASSOCIATION_NEURONS;
+          default:                       return 0;
+      }
+  }
 
-// 根据神经元全局索引判断其所在脑区
-__host__ __device__ inline BrainRegion get_region(int idx) {
-    if (idx < N_SENSORY_NEURONS) {
-        return BrainRegion::SENSORY;
-    } else if (idx < N_SENSORY_NEURONS + N_ASSOCIATION_NEURONS) {
-        return BrainRegion::ASSOCIATION;
-    } else {
-        return BrainRegion::MOTOR;
-    }
-}
+  __host__ __device__ inline int region_size(BrainRegion region) {
+      switch (region) {
+          case BrainRegion::SENSORY:     return N_SENSORY_NEURONS;
+          case BrainRegion::ASSOCIATION: return N_ASSOCIATION_NEURONS;
+          case BrainRegion::MOTOR:       return N_MOTOR_NEURONS;
+          default:                       return 0;
+      }
+  }
+
+  // 根据神经元全局索引判断其所在脑区
+  __host__ __device__ inline BrainRegion get_region(int idx) {
+      if (idx < N_SENSORY_NEURONS) {
+          return BrainRegion::SENSORY;
+      } else if (idx < N_SENSORY_NEURONS + N_ASSOCIATION_NEURONS) {
+          return BrainRegion::ASSOCIATION;
+      } else {
+          return BrainRegion::MOTOR;
+      }
+  }
+#endif
 
 // 根据神经元全局索引判断其类型（每脑区内 80/20 划分兴奋/抑制）
 // 必须与 neuron_kernel.cu 的划分逻辑保持一致
 __host__ __device__ inline NeuronType get_neuron_type(int idx) {
+#ifdef SNN_STAGE2_BUILD
+    // 方案 A: 柱内分层
+    //   柱内 sensory 层:  前 80% (160 个) 兴奋, 后 20% (40 个) 抑制
+    //   柱内 association 层: 前 80% (480 个) 兴奋, 后 20% (120 个) 抑制
+    //   柱内 motor 层:    前 80% (160 个) 兴奋, 后 20% (40 个) 抑制
+    // 这样每柱 800 兴奋 + 200 抑制 = 80/20 全局比例保持
+    int off = idx % STAGE2_NEURONS_PER_COLUMN;  // 0..999
+    int layer_off;  // 层内偏移
+    int layer_size;
+    if (off < STAGE2_COL_SENSORY_SIZE) {
+        layer_off = off;
+        layer_size = STAGE2_COL_SENSORY_SIZE;
+    } else if (off < STAGE2_COL_SENSORY_SIZE + STAGE2_COL_ASSOCIATION_SIZE) {
+        layer_off = off - STAGE2_COL_SENSORY_SIZE;
+        layer_size = STAGE2_COL_ASSOCIATION_SIZE;
+    } else {
+        layer_off = off - STAGE2_COL_SENSORY_SIZE - STAGE2_COL_ASSOCIATION_SIZE;
+        layer_size = STAGE2_NEURONS_PER_COLUMN - STAGE2_COL_SENSORY_SIZE - STAGE2_COL_ASSOCIATION_SIZE;
+    }
+    int layer_exc_count = (int)(layer_size * EXCITATORY_RATIO);
+    return (layer_off < layer_exc_count) ? NeuronType::EXCITATORY
+                                          : NeuronType::INHIBITORY;
+#else
     BrainRegion region = get_region(idx);
     int rs = region_start(region);
     int rn = region_size(region);
@@ -123,6 +201,7 @@ __host__ __device__ inline NeuronType get_neuron_type(int idx) {
     int region_exc_count = (int)(rn * EXCITATORY_RATIO);
     return (region_idx < region_exc_count) ? NeuronType::EXCITATORY
                                            : NeuronType::INHIBITORY;
+#endif
 }
 
 #endif // SNN_TYPES_H

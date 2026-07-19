@@ -14,7 +14,14 @@ public:
     ~SNNNetwork();
 
     // 初始化网络（分配显存 + 生成拓扑）
+    // 注：stage0 用此方法（包含默认 init_synapses 拓扑）。
+    // stage2 不调用此方法，改用 allocate_only() + 自定义拓扑生成器。
     void initialize();
+
+    // Stage2 用：仅分配显存 + 初始化神经元 + 清零工作缓冲区。
+    // 不调用 init_synapses()，因此不依赖 network_init.cu 的符号。
+    // 调用方随后用 columnar_topology.cu 的 init_columnar_synapses() 填充拓扑。
+    void allocate_only();
 
     // 释放资源
     void cleanup();
@@ -42,6 +49,26 @@ public:
 
     // 显存使用报告
     void print_memory_usage() const;
+
+    // =====================================================================
+    // Stage2 accessors: expose private device pointers so stage2 can build
+    // its own columnar topology and run custom training loops.
+    // Stage0 never uses these; they exist solely for stage2.
+    // =====================================================================
+    NeuronState* get_d_neurons()             { return d_neurons_; }
+    Synapse*     get_d_synapses()            { return d_synapses_; }
+    int*         get_d_row_ptr()             { return d_row_ptr_; }
+    int*         get_d_col_idx()             { return d_col_idx_; }
+    float*       get_d_weights()             { return d_weights_; }
+    float*       get_d_input_current()       { return d_input_current_; }
+    bool*        get_d_spikes()              { return d_spikes_; }
+    float*       get_d_external_buf()        { return d_external_buf_; }
+    NetworkStats* get_d_stats()              { return d_stats_; }
+    float        get_dopamine_level() const  { return dopamine_level_; }
+
+    // 标记为已初始化（用于 stage2 在 allocate_only() + 自定义拓扑完成后置位）
+    // 注：allocate_only() 已经内部置位 initialized_=true，调用方一般不需要此方法。
+    void mark_initialized()                  { initialized_ = true; }
 
 private:
     // GPU 内存指针

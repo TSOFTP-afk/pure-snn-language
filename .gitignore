@@ -6,6 +6,8 @@
 src/build/
 src/stage1/build/
 src/stage1/nvcc_test/
+src/stage2/build/
+src/stage2/nvcc_test/
 *.exe
 *.obj
 *.lib
@@ -30,15 +32,25 @@ rules.ninja
 *.ii
 *.gpu
 
-# 训练产物（检查点权重）
+# 训练产物（检查点权重，单文件 39MB，不归档）
 *.bin
 weights_ep*.bin
+data/*_ckpt.bin
 
-# 调试期间临时测试文件（开发时产生的，不归档）
+# 大型语料（超过 GitHub 100MB 单文件限制，请自行下载 LCCC-base）
+# 下载地址：https://github.com/thu-coai/CDial-GPT
+data/lccc_base.txt
+data/lccc_base_split.zip
+
+# 工具链副本（CUDA Toolkit / MSVC / Windows SDK 本地副本，1.3GB，不归档）
+# 用户应自行安装 CUDA Toolkit 13.x 和 Visual Studio 2022 Build Tools
+tools/
+
+# 调试期间临时测试文件
 test_*.cu
 test_*.exe
 
-# 日志
+# 日志（散落在根目录的）
 build_log.txt
 run_log.txt
 *.log
@@ -60,7 +72,7 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
-# Python（如果有辅助脚本）
+# Python
 __pycache__/
 *.pyc
 *.pyo

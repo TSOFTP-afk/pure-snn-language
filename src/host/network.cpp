@@ -40,7 +40,14 @@ void SNNNetwork::allocate_memory() {
     // 工作缓冲区
     CUDA_CHECK(cudaMalloc(&d_input_current_, N_TOTAL_NEURONS * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_spikes_, N_TOTAL_NEURONS * sizeof(bool)));
+    // Stage 2 方案 A: sensory 神经元分散在每柱内，外部输入需要覆盖所有柱的 sensory 层。
+    // 扩展 d_external_buf_ 到 N_TOTAL_NEURONS，step() 也注入全长度。
+    // Stage 0 默认仍是 N_SENSORY_NEURONS（前 2000 个神经元）。
+#ifdef SNN_STAGE2_BUILD
+    CUDA_CHECK(cudaMalloc(&d_external_buf_, N_TOTAL_NEURONS * sizeof(float)));
+#else
     CUDA_CHECK(cudaMalloc(&d_external_buf_, N_SENSORY_NEURONS * sizeof(float)));
+#endif
     CUDA_CHECK(cudaMalloc(&d_stats_, sizeof(NetworkStats)));
 
     print_memory_usage();
@@ -76,13 +83,17 @@ void SNNNetwork::initialize() {
     // 初始化神经元
     init_neurons(d_neurons_, N_TOTAL_NEURONS, seed_);
 
-    // 初始化突触
+    // 初始化突触（stage0 默认拓扑）
+    // stage2 编译时定义 SNN_STAGE2_BUILD，跳过此调用（stage2 用 allocate_only()
+    // + 自定义拓扑生成器，不链接 network_init.cu）
+#ifndef SNN_STAGE2_BUILD
     init_synapses(d_synapses_, d_row_ptr_, d_col_idx_,
                   N_TOTAL_NEURONS, SYNAPSES_PER_NEURON, seed_ + 1);
 
     // 同步权重：d_synapses_.weight → d_weights_
     // 突触传播 CSR 用 d_weights_，STDP 用 d_synapses_，必须保持一致
     sync_weights(d_weights_, d_synapses_, N_TOTAL_SYNAPSES);
+#endif
 
     // 清零工作缓冲区
     clear_current(d_input_current_, N_TOTAL_NEURONS);
@@ -93,6 +104,34 @@ void SNNNetwork::initialize() {
     std::cout << "[Network] 初始化完成" << std::endl;
     std::cout << "  神经元数: " << N_TOTAL_NEURONS << std::endl;
     std::cout << "  突触数:   " << N_TOTAL_SYNAPSES << std::endl;
+}
+
+// Stage2 专用：分配显存 + 初始化神经元 + 清零，但不生成拓扑
+// 调用方随后用 stage2/columnar_topology.cu 的 init_columnar_synapses() 填充突触
+void SNNNetwork::allocate_only() {
+    if (initialized_) return;
+
+    allocate_memory();
+
+    // 初始化神经元状态（与 initialize() 一致）
+    init_neurons(d_neurons_, N_TOTAL_NEURONS, seed_);
+
+    // 清零突触数组（拓扑将由 init_columnar_synapses() 填充）
+    CUDA_CHECK(cudaMemset(d_synapses_, 0, N_TOTAL_SYNAPSES * sizeof(Synapse)));
+    CUDA_CHECK(cudaMemset(d_row_ptr_, 0, (N_TOTAL_NEURONS + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_col_idx_, 0, N_TOTAL_SYNAPSES * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_weights_, 0, N_TOTAL_SYNAPSES * sizeof(float)));
+
+    // 清零工作缓冲区
+    clear_current(d_input_current_, N_TOTAL_NEURONS);
+    CUDA_CHECK(cudaMemset(d_spikes_, 0, N_TOTAL_NEURONS * sizeof(bool)));
+    CUDA_CHECK(cudaMemset(d_stats_, 0, sizeof(NetworkStats)));
+
+    initialized_ = true;
+    std::cout << "[Network] allocate_only() 完成（拓扑未生成，等待 stage2 填充）"
+              << std::endl;
+    std::cout << "  神经元数: " << N_TOTAL_NEURONS << std::endl;
+    std::cout << "  突触容量: " << N_TOTAL_SYNAPSES << std::endl;
 }
 
 void SNNNetwork::cleanup() {
@@ -113,11 +152,21 @@ void SNNNetwork::step(const float* h_external_input, int time_step) {
     //    时序：必须在 clear_current 之后、lif_update 之前
     if (h_external_input != nullptr) {
         // 复用 network 持有的 device 缓冲区（避免每步 cudaMalloc）
+        // Stage 2 方案 A: 输入向量长度 = N_TOTAL_NEURONS（sensory 神经元分散在每柱内）
+        // Stage 0 默认: 输入向量长度 = N_SENSORY_NEURONS（前 2000 个神经元）
+#ifdef SNN_STAGE2_BUILD
+        CUDA_CHECK(cudaMemcpy(d_external_buf_, h_external_input,
+                              N_TOTAL_NEURONS * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        ::inject_input(d_input_current_, d_external_buf_,
+                       N_TOTAL_NEURONS, 1.0f);
+#else
         CUDA_CHECK(cudaMemcpy(d_external_buf_, h_external_input,
                               N_SENSORY_NEURONS * sizeof(float),
                               cudaMemcpyHostToDevice));
         ::inject_input(d_input_current_, d_external_buf_,
                        N_SENSORY_NEURONS, 1.0f);
+#endif
     }
 
     // 4. LIF 神经元更新
@@ -136,8 +185,9 @@ void SNNNetwork::step(const float* h_external_input, int time_step) {
     // 7. 更新发放率（用于监控）
     update_fire_rate(d_neurons_, d_spikes_, N_TOTAL_NEURONS, 0.95f);
 
-    // 8. 统计
-    compute_stats(d_neurons_, d_spikes_, d_stats_, N_TOTAL_NEURONS);
+    // 8. 统计（含 mean_fire_rate + mean_weight，stage2 增强）
+    compute_stats(d_neurons_, d_spikes_, d_stats_, N_TOTAL_NEURONS,
+                  d_weights_, N_TOTAL_SYNAPSES);
 }
 
 void SNNNetwork::reset() {
