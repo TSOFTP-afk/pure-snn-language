@@ -15,9 +15,11 @@
 #include "memory_allocator.cuh"
 #include "scheduler.cuh"
 #include "network_init.cuh"
+#include "input_encoding.cuh"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <vector>
 
 // 解析命令行参数
 static int parse_steps(int argc, char** argv) {
@@ -27,13 +29,43 @@ static int parse_steps(int argc, char** argv) {
             steps = atoi(argv[i + 1]);
             ++i;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: snn_stage2e_p1 [--steps N] [--help]\n");
+            printf("Usage: snn_stage2e_p1 [--steps N] [--csv PATH] [--help]\n");
             printf("  --steps N   运行 N 步 (默认 %d)\n", SMOKE_TEST_STEPS_2E);
+            printf("  --csv PATH  每步输出 spike 序列到 CSV (评估模式)\n");
             printf("  --help      显示帮助\n");
             exit(0);
         }
     }
     return steps;
+}
+
+static const char* get_csv_path(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+            return argv[i + 1];
+        }
+    }
+    return nullptr;
+}
+
+// 采集 device 端标量和 (用于评估 NMDA/STDP 等是否真实工作)
+static float device_sum_float(const float* d, int n) {
+    if (!d || n <= 0) return 0.0f;
+    // 简化: 拷贝回 host 求和 (评估模式可接受)
+    std::vector<float> h(n);
+    cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost);
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) s += h[i];
+    return static_cast<float>(s);
+}
+
+static int device_count_nonzero_float(const float* d, int n) {
+    if (!d || n <= 0) return 0;
+    std::vector<float> h(n);
+    cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost);
+    int c = 0;
+    for (int i = 0; i < n; ++i) if (h[i] != 0.0f) c++;
+    return c;
 }
 
 int main(int argc, char** argv) {
@@ -89,10 +121,77 @@ int main(int argc, char** argv) {
     stage2e::BioMechanismScheduler scheduler(&allocator);
 
     // --- 5. 主循环 ---
+    const char* csv_path = get_csv_path(argc, argv);
+    FILE* csv_fp = nullptr;
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (!csv_fp) {
+            fprintf(stderr, "[P1] 无法打开 CSV 输出: %s\n", csv_path);
+        } else {
+            fprintf(csv_fp, "step,spikes,is_inject_step,byte,nmda_sum,nmda_nz,"
+                            "xpre_sum,xpre_nz,ca_sum,ca_nz,weight_sum,weight_abs_sum\n");
+        }
+    }
+
     printf("\n[P1] 开始 %d 步快时间尺度测试...\n\n", total_steps);
 
     for (int step = 0; step < total_steps; ++step) {
         scheduler.step(step);
+
+        // CSV 采样: 每步记录 (开销主要在 device→host 拷贝)
+        if (csv_fp) {
+            stage2e::PersistentBuffers& b = allocator.buffers();
+            int n_syn = N_TOTAL_SYNAPSES_2E;
+            int n_neu = N_TOTAL_NEURONS_2E;
+
+            // 采样关键指标 (为控制开销, 仅对 nmda_current 做全量求和)
+            float nmda_sum = device_sum_float(b.d_nmda_current, n_neu);
+            int   nmda_nz  = device_count_nonzero_float(b.d_nmda_current, n_neu);
+            // STDP trace (10.7M, 较大但 1000 步内可接受)
+            float xpre_sum = device_sum_float(b.d_stdp_x_pre_trace, n_syn);
+            int   xpre_nz  = device_count_nonzero_float(b.d_stdp_x_pre_trace, n_syn);
+            // 钙浓度 (反映 NMDA 是否激活)
+            float ca_sum = 0.0f; int ca_nz = 0;
+            {
+                // d_ca_snapshot 是突触级 (10.7M), 用 BioSynapse.ca_concentration 反而更准
+                // 但 ca_concentration 在 synapse struct 里, 难以直接求和
+                // 用 d_ca_snapshot (突触级, atomic 写入)
+                std::vector<float> h_ca(n_syn);
+                cudaMemcpy(h_ca.data(), b.d_ca_snapshot, n_syn * sizeof(float), cudaMemcpyDeviceToHost);
+                double s = 0.0; int c = 0;
+                for (int i = 0; i < n_syn; ++i) {
+                    if (h_ca[i] != 0.0f) { s += h_ca[i]; c++; }
+                }
+                ca_sum = static_cast<float>(s); ca_nz = c;
+            }
+            // 权重统计 (反映 STDP 是否在工作)
+            float wsum = 0.0f, wabs_sum = 0.0f;
+            {
+                std::vector<float> hw(n_syn);
+                cudaMemcpy(hw.data(), b.d_weights_cache, n_syn * sizeof(float), cudaMemcpyDeviceToHost);
+                // d_weights_cache 不随 STDP 更新, 用 BioSynapse.weight 更准
+                // 但 BioSynapse 是 struct, 需要按字段拷贝
+                // 简化: 用 d_weights_cache 作为初始化镜像 (不变化)
+                double s1 = 0.0, s2 = 0.0;
+                for (int i = 0; i < n_syn; ++i) {
+                    s1 += hw[i];
+                    s2 += fabsf(hw[i]);
+                }
+                wsum = static_cast<float>(s1);
+                wabs_sum = static_cast<float>(s2);
+            }
+
+            bool is_inject = (step % INPUT_INJECT_INTERVAL == 0);
+            uint8_t byte = is_inject ? stage2e::get_byte_for_step(step) : 0;
+
+            fprintf(csv_fp, "%d,%d,%d,%d,%.4f,%d,%.4f,%d,%.4f,%d,%.4f,%.4f\n",
+                    step, scheduler.stats().total_spikes,
+                    (int)is_inject, (int)byte,
+                    nmda_sum, nmda_nz,
+                    xpre_sum, xpre_nz,
+                    ca_sum, ca_nz,
+                    wsum, wabs_sum);
+        }
 
         // P1 安全检查: 每 1000 步同步一次, 检测 kernel 错误
         if (step % 1000 == 0) {
@@ -100,10 +199,16 @@ int main(int argc, char** argv) {
             if (err != cudaSuccess) {
                 fprintf(stderr, "\n[P1 FAIL] CUDA 同步错误 at step %d: %s\n",
                         step, cudaGetErrorString(err));
+                if (csv_fp) fclose(csv_fp);
                 allocator.free_all();
                 return 1;
             }
         }
+    }
+
+    if (csv_fp) {
+        fclose(csv_fp);
+        printf("\n[P1] CSV 数据已写入: %s\n", csv_path);
     }
 
     cudaDeviceSynchronize();

@@ -80,11 +80,15 @@ __global__ void lif_adex_kernel(
         return;
     }
 
-    // ----- 1. 综合输入电流 -----
-    // input_current 已包含: 外部群体编码输入 + 延迟队列注入
-    // nmda_current: 上一轮 synapse_nmda_kernel 计算的 NMDA 电流
-    // inhibitory_current: 上一轮 inhibitory_kernel 计算的抑制电流
-    float I_total = input_current[i] + nmda_current[i] - inhibitory_current[i];
+    // ----- 1. 综合输入电流 (漏积分器累积, P1 修正) -----
+    // P1 修正: 原版每步直接用 input_current[i], 电流无法跨步累积
+    //   导致注入步 dV=0.98 < 阈值 1.0, 非注入步完全静默
+    // 改: 用 NeuronStateAdEx.synaptic_current 作为漏积分器
+    //   τ_syn = 3 步 (衰减系数 0.7), 让电流持续 ~5 步累积 V 越过阈值
+    //   公式: s(t+1) = s(t) * 0.7 + I_external * 0.3
+    //   效果: 单次注入 9.0 → 5 步累积 s ≈ 6.3 → 5 步 dV 累积 ≈ 3.4 → V 越阈值
+    n.synaptic_current = n.synaptic_current * 0.7f + input_current[i] * 0.3f;
+    float I_total = n.synaptic_current + nmda_current[i] - inhibitory_current[i];
 
     // ----- 2. AdEx 动力学 (归一化版本) -----
     // τ_m * dV/dt = -V + Δ_T * exp((V - V_T)/Δ_T) - w + I

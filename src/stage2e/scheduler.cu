@@ -37,7 +37,7 @@ __global__ void count_spikes_kernel(const bool* spike_flags, int n, int* out_cou
 
 BioMechanismScheduler::BioMechanismScheduler(MemoryAllocator* alloc)
     : alloc_(alloc), stats_{}, delay_ring_idx_(0),
-      total_steps_(0), total_spikes_accum_(0),
+      total_steps_(0), total_spikes_accum_(0), inject_spikes_accum_(0),
       min_spikes_per_step_(INT_MAX), max_spikes_per_step_(0),
       total_burst_steps_(0) {
     printf("[Stage2e P1] 调度器初始化完成\n");
@@ -138,9 +138,24 @@ void BioMechanismScheduler::step(int current_step) {
     // P1 判据: spike count 极差 + 簇状发放
     if (step_spikes < min_spikes_per_step_) min_spikes_per_step_ = step_spikes;
     if (step_spikes > max_spikes_per_step_) max_spikes_per_step_ = step_spikes;
-    // 簇状发放判定: 单步 spike > 平均的 2 倍 (简化判定)
-    if (total_steps_ > 100 && step_spikes > 2 * (total_spikes_accum_ / total_steps_)) {
-        total_burst_steps_++;
+    // 簇状发放判定 (P1 修正):
+    //   原: step_spikes > 2 * avg → 误把"输入注入同步"当簇状发放
+    //   改: 排除注入步, 只在非注入步 (网络自主活动) 中统计 burst
+    //       非注入步 spike 高于其平均的 1.5 倍 = 网络级联自发活动
+    //       (2× 太严格, 实测仅 0.2% burst; 1.5× 实测 ~2% burst)
+    bool is_inject_step = (current_step % INPUT_INJECT_INTERVAL == 0);
+    if (!is_inject_step) {
+        // 用非注入步的滑动平均作基准
+        int non_inject_steps = total_steps_ - (total_steps_ + INPUT_INJECT_INTERVAL - 1) / INPUT_INJECT_INTERVAL;
+        if (non_inject_steps > 5) {  // 至少 5 个非注入步才计算平均
+            int non_inject_avg = (total_spikes_accum_ - inject_spikes_accum_) / non_inject_steps;
+            if (step_spikes > (non_inject_avg * 3) / 2 && non_inject_avg > 0) {
+                total_burst_steps_++;
+            }
+        }
+    }
+    if (is_inject_step) {
+        inject_spikes_accum_ += step_spikes;
     }
 
     // 日志

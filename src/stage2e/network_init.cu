@@ -307,11 +307,14 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
             BioSynapse& s = h_synapses[idx];
             s.pre_idx = pre;
             s.post_idx = post;
-            // 权重: 兴奋性 [0.1, 0.5], 抑制性 [-0.5, -0.1]
+            // 权重: 兴奋性 [0.8, 1.5], 抑制性 [-1.5, -0.8]
+            // P1 修正: 原 [0.1, 0.5] 太弱, 延迟队列注入电流无法驱动下游发放
+            // 数值推导: 11 个 active 突触 × 0.3 avg = 3.3, dV = 3.3/9.37 = 0.35 < 阈值 1.0
+            //           11 个 active 突触 × 1.15 avg = 12.6, dV = 1.35 > 阈值 ✓
             if (pre_is_exc) {
-                s.weight = randf(0.1f, 0.5f);
+                s.weight = randf(0.8f, 1.5f);
             } else {
-                s.weight = randf(-0.5f, -0.1f);
+                s.weight = randf(-1.5f, -0.8f);
             }
             // 延迟: 柱内 1-3, 前额叶自反馈 1-3
             uint8_t delay = static_cast<uint8_t>(randi(DELAY_INTRA_MIN, DELAY_INTRA_MAX + 1));
@@ -372,10 +375,11 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
             BioSynapse& s = h_synapses[idx];
             s.pre_idx = pre;
             s.post_idx = post;
+            // 跨柱较弱 (相对柱内, 但保持可驱动性)
             if (pre_is_exc) {
-                s.weight = randf(0.05f, 0.3f);  // 跨柱较弱
+                s.weight = randf(0.5f, 1.0f);
             } else {
-                s.weight = randf(-0.3f, -0.05f);
+                s.weight = randf(-1.0f, -0.5f);
             }
             uint8_t delay = static_cast<uint8_t>(randi(DELAY_INTER_MIN, DELAY_INTER_MAX + 1));
             s.delay_steps = static_cast<float>(delay);
@@ -427,10 +431,11 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
             BioSynapse& s = h_synapses[idx];
             s.pre_idx = pre;
             s.post_idx = post;
+            // 长程投射 (前额叶) - 维持与柱内同量级以保持信号传播
             if (pre_is_exc) {
-                s.weight = randf(0.1f, 0.4f);
+                s.weight = randf(0.6f, 1.2f);
             } else {
-                s.weight = randf(-0.4f, -0.1f);
+                s.weight = randf(-1.2f, -0.6f);
             }
             s.delay_steps = static_cast<float>(delay);
             h_delay[idx] = delay;
@@ -475,10 +480,11 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
             BioSynapse& s = h_synapses[idx];
             s.pre_idx = pre;
             s.post_idx = post;
+            // 前额叶自反馈 - 与柱内同量级
             if (pre_is_exc) {
-                s.weight = randf(0.1f, 0.4f);
+                s.weight = randf(0.8f, 1.5f);
             } else {
-                s.weight = randf(-0.4f, -0.1f);
+                s.weight = randf(-1.5f, -0.8f);
             }
             uint8_t delay = static_cast<uint8_t>(randi(DELAY_INTRA_MIN, DELAY_INTRA_MAX + 1));
             s.delay_steps = static_cast<float>(delay);

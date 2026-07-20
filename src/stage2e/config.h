@@ -129,7 +129,9 @@ static_assert(COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E + COL_MOTOR_SIZE_2E
 //   要让 V 从 0 → 1.0 单步发放, 需 I ≥ 9.37
 //   设计文档原值 1.5 严重不足 (dV=0.16), 调整为 15.0 (dV=1.6, 28% 余量)
 #define POP_CODING_GAIN           15.0f    // 输入增益 (P1 修正: 1.5→15.0)
-#define INPUT_INJECT_INTERVAL     10       // 每 10 步注入一个新字节 (避免饱和)
+// P1 修正: 10 步间隔导致 90% 步静默, 改为 5 步 (50% 注入密度)
+// 配合修复后的权重 [0.8, 1.5], 延迟队列可在非注入步维持活动
+#define INPUT_INJECT_INTERVAL     5        // 每 5 步注入一个新字节 (P1 修正: 10→5)
 #define INPUT_TEXT_CORPUS_LEN     256      // 0..255 字节遍历 (P1 用伪字节流)
 
 // -----------------------------------------------------------------------------

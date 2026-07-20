@@ -96,6 +96,7 @@ private:
     // P1 统计
     int total_steps_;
     int total_spikes_accum_;
+    int inject_spikes_accum_;     // P1 修正: 注入步累计脉冲 (用于排除 burst 误判)
     int min_spikes_per_step_;
     int max_spikes_per_step_;
     int total_burst_steps_;  // 簇状发放步数
