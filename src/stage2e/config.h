@@ -81,6 +81,56 @@ static_assert(COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E + COL_MOTOR_SIZE_2E
 #define NMDA_MG_BLOCK_THRESHOLD   -0.4f    // V_norm, 对应 ~-50 mV
 #define NMDA_CA_TAU                50.0f   // ms, 钙衰减时间常数
 #define NMDA_CONDUCTANCE_MAX      0.05f
+#define NMDA_MG_CONCENTRATION     1.0f     // [Mg²⁺] mM (生理浓度)
+#define NMDA_TAU                  150.0f   // ms, NMDA 电导衰减
+#define NMDA_G_MAX                0.5f     // NMDA 峰值电导 (nS)
+
+// AMPA 受体 (快速兴奋性)
+#define AMPA_TAU                  5.0f     // ms
+#define AMPA_G_MAX                1.0f     // AMPA 峰值电导
+
+// GABA_A / GABA_B (抑制性)
+#define GABA_A_TAU                10.0f    // ms
+#define GABA_A_G_MAX              1.0f
+#define GABA_B_TAU                150.0f   // ms
+#define GABA_B_G_MAX              0.3f
+
+// -----------------------------------------------------------------------------
+// AdEx 适应性参数 (Brette & Gerstner 2005, §2.1)
+// -----------------------------------------------------------------------------
+#define ADEX_A_ADAPT              4.0f     // nS, 适应耦合电导
+#define ADEX_B_RESET              0.0805f  // nA, 脉冲后适应跳变 (簇状发放关键)
+#define ADEX_TAU_W                144.0f   // ms, 适应时间常数
+#define ADEX_TAU_W_INV            (1.0f / ADEX_TAU_W)
+#define ADEX_V_THRESH_NORM        1.0f     // V_norm 阈值
+#define ADEX_V_RESET_NORM         0.0f     // V_norm 重置值
+#define ADEX_REFRACTORY_STEPS     2        // 不应期步数
+
+// 阈值动态 (钠通道失活)
+#define ADEX_THETA_ADAPT_RATE     0.001f   // 每脉冲阈值提升率
+#define ADEX_THETA_DECAY          0.999f   // 阈值衰减
+#define ADEX_THETA_MAX            0.3f     // 最大阈值偏移 (V_norm 单位)
+
+// -----------------------------------------------------------------------------
+// 短期可塑性 STP (§2.2, Tsodyks-Markram 1998)
+// -----------------------------------------------------------------------------
+#define STP_U_SE                  0.2f     // 兴奋性基线利用率 U
+#define STP_U_SI                  0.05f    // 抑制性基线利用率 U
+#define STP_TAU_FAC               200.0f   // ms, 易化时间常数
+#define STP_TAU_REC               500.0f   // ms, 恢复时间常数
+#define STP_TAU_FAC_INV           (1.0f / STP_TAU_FAC)
+#define STP_TAU_REC_INV           (1.0f / STP_TAU_REC)
+
+// -----------------------------------------------------------------------------
+// 群体编码输入 (§2.3)
+// -----------------------------------------------------------------------------
+#define POP_CODING_K_PER_COLUMN   50       // 每柱激活神经元数 (50 × 50 = 2500)
+// P1 修正: AdEx 归一化阈值 V_norm=1.0, τ_m=9.37, 单步 dV=I/τ_m
+//   要让 V 从 0 → 1.0 单步发放, 需 I ≥ 9.37
+//   设计文档原值 1.5 严重不足 (dV=0.16), 调整为 15.0 (dV=1.6, 28% 余量)
+#define POP_CODING_GAIN           15.0f    // 输入增益 (P1 修正: 1.5→15.0)
+#define INPUT_INJECT_INTERVAL     10       // 每 10 步注入一个新字节 (避免饱和)
+#define INPUT_TEXT_CORPUS_LEN     256      // 0..255 字节遍历 (P1 用伪字节流)
 
 // -----------------------------------------------------------------------------
 // 突触级调质受体密度 (v3 强化 B)

@@ -2,21 +2,20 @@
 #define SNN_STAGE2E_SCHEDULER_CUH
 
 // =============================================================================
-// Stage 2e 统一调度器 (P0 骨架)
+// Stage 2e 统一调度器 (P1)
 // =============================================================================
 // 对应设计文档 §5.4: v4 调度器
 //
-// P0 阶段:
-//   - 所有 kernel 为占位实现 (no-op, 仅清零 / 简单统计)
-//   - 调用顺序必须与 v4 设计一致, 验证流水线正确性
-//   - 每 LOG_INTERVAL_2E 步打印一次统计信息
+// P1 阶段:
+//   - 快时间尺度 kernel 全部替换为真实实现 (AdEx + NMDA + STDP + STP)
+//   - 中/慢时间尺度仍为占位 (留给 Phase 2-4)
+//   - 群体编码输入注入
+//   - spike count 统计 (P1 判据: 极差 > 100, 簇状发放出现)
 //
 // 流水线:
-//   delay_dispatch → lif_adex → synapse_nmda → stdp_dual_trace → stdp_stp
-//        ↓                                                            ↓
-//   (按 delay 写入队列)                                   (每10步) camkii_kernel
-//                                                                  ↓
-//                                                          stdp_eligibility
+//   delay_inject → input_inject → lif_adex → synapse_nmda
+//       → stdp_dual_trace → stdp_stp → delay_dispatch
+//   (每10步) camkii, stdp_eligibility, inhibitory_network
 //   (每100步) modulatory, scaling, wm_update
 //   (每1000步) structural_plasticity, developmental
 //   (每10000步) replay
@@ -25,6 +24,7 @@
 #include "config.h"
 #include "types.h"
 #include "memory_allocator.cuh"
+#include <climits>
 
 namespace stage2e {
 
@@ -67,16 +67,25 @@ public:
     BioMechanismScheduler(MemoryAllocator* alloc);
     ~BioMechanismScheduler();
 
-    // 主步进函数 (P0: 占位实现, 仅做计数与日志)
+    // 主步进函数
     void step(int current_step);
 
     // 获取统计
     const NetworkStats2e& stats() const { return stats_; }
     int delay_ring_idx() const { return delay_ring_idx_; }
 
-    // P0 阶段统计累计
+    // P1 统计
     int total_steps_executed() const { return total_steps_; }
     int total_spikes_accum() const { return total_spikes_accum_; }
+    int min_spikes_per_step() const { return min_spikes_per_step_; }
+    int max_spikes_per_step() const { return max_spikes_per_step_; }
+    int spike_range() const {
+        return max_spikes_per_step_ - min_spikes_per_step_;
+    }
+    int total_burst_steps() const { return total_burst_steps_; }
+    float burst_ratio() const {
+        return total_steps_ > 0 ? (100.0f * total_burst_steps_ / total_steps_) : 0.0f;
+    }
 
 private:
     MemoryAllocator* alloc_;
@@ -84,17 +93,17 @@ private:
     DevPhaseTable phase_table_;
     int delay_ring_idx_;
 
-    // P0 统计累计
+    // P1 统计
     int total_steps_;
     int total_spikes_accum_;
+    int min_spikes_per_step_;
+    int max_spikes_per_step_;
+    int total_burst_steps_;  // 簇状发放步数
 
-    // --- P0 占位 kernel 启动器 (实际为 no-op 或简单 cudaMemset) ---
-    void launch_delay_dispatch(int step);
-    void launch_lif_adex(int step);
-    void launch_synapse_nmda(int step);
-    void launch_stdp_dual_trace(int step);
-    void launch_stdp_stp(int step);
+    // device 端 spike 计数器 (用于 atomicAdd 统计)
+    int* d_spike_counter_;
 
+    // --- P1 占位 kernel 启动器 (中/慢时间尺度, Phase 2-4 实现) ---
     void launch_camkii_kernel(int step);
     void launch_stdp_eligibility(int step);
     void launch_inhibitory_network(int step);

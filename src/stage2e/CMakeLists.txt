@@ -1,12 +1,15 @@
 # =============================================================================
-# Stage 2e: 多层级生物机制增强方案 v4 - Phase 0
+# Stage 2e: 多层级生物机制增强方案 v4 - Phase 1
 # =============================================================================
 # 设计文档: docs/superpowers/specs/2026-07-19-bio-mechanisms-design.md
 #
-# P0 范围:
+# P1 范围:
 #   - 显存分配器 (1.33GB GPU 缓冲)
-#   - 调度器骨架 (v4 流水线, 占位 kernel)
-#   - 10K 步烟雾测试
+#   - 网络初始化 (55K 神经元 / 10.7M 突触 / CSR 拓扑)
+#   - 快时间尺度 kernel: AdEx + NMDA + STDP + STP + 延迟队列
+#   - 群体编码输入注入 (50 柱 × 50 神经元)
+#   - 调度器 (v4 流水线, 中/慢时间尺度占位)
+#   - 10K 步烟雾测试 + P1 判据检查
 #
 # 依赖: 仅 CUDA Toolkit, 不复用 stage0/1/2 代码 (完全独立)
 # =============================================================================
@@ -28,10 +31,12 @@ add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
 
 if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>)
-    # 关闭 MSVC 对未使用参数的警告 (P0 占位 kernel 必然有未用参数)
+    # 关闭 MSVC 对未使用参数的警告 (P1 占位 kernel 必然有未用参数)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4100>)
-    # 关闭 size_t 到 int 转换警告 (P0 简化代码用 int)
+    # 关闭 size_t 到 int 转换警告 (简化代码用 int)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4267>)
+    # 关闭无符号/有符号比较警告
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4018>)
 else()
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>)
 endif()
@@ -43,32 +48,36 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-# P0 源文件 (不含 stage0 复用, 完全独立)
-set(STAGE2E_P0_SRCS
+# P1 源文件 (不含 stage0 复用, 完全独立)
+set(STAGE2E_P1_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/network_init.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuron_kernels.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/synapse_kernels.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/input_encoding.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
 )
 
 # =============================================================================
-# Target: snn_stage2e_p0
+# Target: snn_stage2e_p1
 # =============================================================================
-add_executable(snn_stage2e_p0 ${STAGE2E_P0_SRCS})
+add_executable(snn_stage2e_p1 ${STAGE2E_P1_SRCS})
 
-target_include_directories(snn_stage2e_p0 PRIVATE
+target_include_directories(snn_stage2e_p1 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-# P0 不需要任何 stage0/1/2 编译定义
+# P1 不需要任何 stage0/1/2 编译定义
 # 不链接任何外部库 (除 CUDA runtime)
 
-target_compile_options(snn_stage2e_p0 PRIVATE
+target_compile_options(snn_stage2e_p1 PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
     $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>
 )
 
 # RTX 3060 = compute capability 8.6 (Ampere)
-set_target_properties(snn_stage2e_p0 PROPERTIES
+set_target_properties(snn_stage2e_p1 PROPERTIES
     CUDA_ARCHITECTURES "86"
 )
