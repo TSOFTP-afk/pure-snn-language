@@ -42,7 +42,6 @@ namespace stage2e {
 __global__ void synapse_nmda_kernel(
     BioSynapse* __restrict__ synapses,
     const NeuronStateAdEx* __restrict__ neurons,
-    const bool* __restrict__ spike_flags,
     float* __restrict__ nmda_current,         // 累积到 post 神经元的 NMDA 电流
     float* __restrict__ ca_snapshot,          // 当前步钙快照 (覆盖写入)
     int n_synapses,
@@ -52,7 +51,6 @@ __global__ void synapse_nmda_kernel(
     if (i >= n_synapses) return;
 
     BioSynapse& s = synapses[i];
-    int pre  = s.pre_idx;
     int post = s.post_idx;
 
     // 读取突触后神经元电压
@@ -76,15 +74,6 @@ __global__ void synapse_nmda_kernel(
     s.ampa_conductance *= ampa_decay;
     s.ca_concentration *= ca_decay;
 
-    // pre 脉冲时: 电导跳变 (依赖 STP resource)
-    bool pre_spike = spike_flags[pre];
-    if (pre_spike) {
-        // AMPA: 快速增加, 受 STP resource 调制
-        s.ampa_conductance += AMPA_G_MAX * s.resource * s.utilization;
-        // NMDA: 慢速增加, 同样受 STP 调制
-        s.nmda_conductance += NMDA_G_MAX * s.resource * s.utilization;
-    }
-
     // 钙浓度更新 (仅 NMDA 开放时)
     float ca_inflow = s.nmda_conductance * mg_factor * 0.01f;
     s.ca_concentration += ca_inflow;
@@ -106,6 +95,26 @@ __global__ void synapse_nmda_kernel(
     }
 }
 
+__global__ void synapse_arrival_conductance_kernel(
+    BioSynapse* __restrict__ synapses,
+    const int* __restrict__ delay_ring_indices,
+    int arrived_ring_idx,
+    int arrived_count)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= arrived_count) return;
+
+    int slot_base = arrived_ring_idx * DELAY_RING_SLOT_CAPACITY;
+    int syn_idx = delay_ring_indices[slot_base + i];
+    if (syn_idx < 0) return;
+
+    BioSynapse& s = synapses[syn_idx];
+    s.ampa_conductance += AMPA_G_MAX * s.resource * s.utilization;
+    if (s.receptor_flags & 0x02) {
+        s.nmda_conductance += NMDA_G_MAX * s.resource * s.utilization;
+    }
+}
+
 // =============================================================================
 // stdp_dual_trace_kernel: STDP 双 trace + Δw 计算
 // =============================================================================
@@ -121,10 +130,8 @@ __global__ void stdp_dual_trace_kernel(
     if (i >= n_synapses) return;
 
     BioSynapse& s = synapses[i];
-    int pre  = s.pre_idx;
     int post = s.post_idx;
 
-    bool pre_spike  = spike_flags[pre];
     bool post_spike = spike_flags[post];
 
     // ----- 1. trace 衰减 -----
@@ -136,22 +143,14 @@ __global__ void stdp_dual_trace_kernel(
 
     // ----- 2. 计算 Δw (必须在更新 last_spike 之前) -----
     // LTP: pre 在 post 之前 → x_pre * post_spike
-    // LTD: post 在 pre 之前 → x_post * pre_spike
+    // LTD 由延迟到达事件 pass 处理，避免直接读取当前 pre spike
     float delta_w = 0.0f;
     if (post_spike) {
         // post 脉冲: 检查 pre trace (即 x_pre 残留 = pre 是否刚发过)
         delta_w += s.x_pre_trace * STDP_A_PLUS_2E;
     }
-    if (pre_spike) {
-        // pre 脉冲: 检查 post trace
-        delta_w -= s.x_post_trace * STDP_A_MINUS_2E;
-    }
 
     // ----- 3. trace 跳变 (脉冲时) -----
-    if (pre_spike) {
-        s.x_pre_trace += STDP_A_PLUS_2E;  // pre trace 跳变
-        s.last_pre_spike = static_cast<float>(step);
-    }
     if (post_spike) {
         s.x_post_trace += STDP_A_MINUS_2E;  // post trace 跳变
         s.last_post_spike = static_cast<float>(step);
@@ -179,20 +178,58 @@ __global__ void stdp_dual_trace_kernel(
     stdp_x_pre_trace[i] = s.x_pre_trace;
 }
 
+__global__ void stdp_arrival_pre_kernel(
+    BioSynapse* __restrict__ synapses,
+    const int* __restrict__ delay_ring_indices,
+    float* __restrict__ stdp_x_pre_trace,
+    int arrived_ring_idx,
+    int arrived_count,
+    int step,
+    float plasticity_gain)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= arrived_count) return;
+
+    int slot_base = arrived_ring_idx * DELAY_RING_SLOT_CAPACITY;
+    int syn_idx = delay_ring_indices[slot_base + i];
+    if (syn_idx < 0) return;
+
+    BioSynapse& s = synapses[syn_idx];
+    float delta_w = -s.x_post_trace * STDP_A_MINUS_2E;
+    s.x_pre_trace += STDP_A_PLUS_2E;
+    s.last_pre_spike = static_cast<float>(step);
+
+    float eta = 0.01f;
+    s.weight += eta * delta_w * plasticity_gain;
+
+    bool is_exc = (s.receptor_flags & 0x03);
+    if (is_exc) {
+        if (s.weight < 0.0f) s.weight = 0.0f;
+        if (s.weight > STDP_W_MAX_2E) s.weight = STDP_W_MAX_2E;
+    } else {
+        if (s.weight > 0.0f) s.weight = 0.0f;
+        if (s.weight < -STDP_W_MAX_2E) s.weight = -STDP_W_MAX_2E;
+    }
+    stdp_x_pre_trace[syn_idx] = s.x_pre_trace;
+}
+
 // =============================================================================
 // stdp_stp_kernel: 短期可塑性 (Tsodyks-Markram 1998)
 // =============================================================================
 __global__ void stdp_stp_kernel(
     BioSynapse* __restrict__ synapses,
-    const bool* __restrict__ spike_flags,
-    int n_synapses)
+    const int* __restrict__ delay_ring_indices,
+    int arrived_ring_idx,
+    int arrived_count)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_synapses) return;
+    if (i >= arrived_count) return;
 
-    BioSynapse& s = synapses[i];
-    int pre = s.pre_idx;
-    bool pre_spike = spike_flags[pre];
+    int slot_base = arrived_ring_idx * DELAY_RING_SLOT_CAPACITY;
+    int syn_idx = delay_ring_indices[slot_base + i];
+    if (syn_idx < 0) return;
+
+    BioSynapse& s = synapses[syn_idx];
 
     // 衰减 (每步)
     float fac_decay = expf(-1.0f / STP_TAU_FAC);  // ~0.995
@@ -204,42 +241,46 @@ __global__ void stdp_stp_kernel(
     float baseline_u = (s.receptor_flags & 0x03) ? STP_U_SE : STP_U_SI;
     s.utilization = baseline_u + (s.utilization - baseline_u) * fac_decay;
 
-    // pre 脉冲时: STP 更新
-    if (pre_spike) {
-        // 易化: u 增大 (利用率提升)
-        float u_new = s.utilization + baseline_u * (1.0f - s.utilization);
-        // 抑制: r 减小 (资源消耗)
-        float r_new = s.resource * (1.0f - u_new);
+    // 到达事件时: STP 更新
+    float u_new = s.utilization + baseline_u * (1.0f - s.utilization);
+    float r_new = s.resource * (1.0f - u_new);
 
-        s.utilization = u_new;
-        s.resource = r_new;
-        // 防止数值发散
-        if (s.utilization > 1.0f) s.utilization = 1.0f;
-        if (s.resource < 0.0f) s.resource = 0.0f;
-    }
+    s.utilization = u_new;
+    s.resource = r_new;
+    if (s.utilization > 1.0f) s.utilization = 1.0f;
+    if (s.resource < 0.0f) s.resource = 0.0f;
 }
 
 // =============================================================================
 // Host launchers
 // =============================================================================
-void launch_synapse_nmda(MemoryAllocator* alloc, int step) {
+void launch_synapse_nmda(MemoryAllocator* alloc, int step, int arrived_ring_idx, int arrived_count) {
     PersistentBuffers& b = alloc->buffers();
 
     // 清零 nmda_current (准备累积)
     cudaMemsetAsync(b.d_nmda_current, 0, N_TOTAL_NEURONS_2E * sizeof(float));
 
+    if (arrived_count > 0) {
+        int arrival_blocks = (arrived_count + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+        synapse_arrival_conductance_kernel<<<arrival_blocks, THREADS_PER_BLOCK_2E>>>(
+            b.d_synapses,
+            b.d_delay_ring_indices,
+            arrived_ring_idx,
+            arrived_count);
+    }
+
     int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     synapse_nmda_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         b.d_synapses,
         b.d_neurons,
-        b.d_spike_flags,
         b.d_nmda_current,
         b.d_ca_snapshot,
         N_TOTAL_SYNAPSES_2E,
         step);
 }
 
-void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_gain) {
+void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_gain,
+                            int arrived_ring_idx, int arrived_count) {
     PersistentBuffers& b = alloc->buffers();
     int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     stdp_dual_trace_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
@@ -249,15 +290,30 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
         N_TOTAL_SYNAPSES_2E,
         step,
         plasticity_gain);
+
+    if (arrived_count > 0) {
+        int arrival_blocks = (arrived_count + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+        stdp_arrival_pre_kernel<<<arrival_blocks, THREADS_PER_BLOCK_2E>>>(
+            b.d_synapses,
+            b.d_delay_ring_indices,
+            b.d_stdp_x_pre_trace,
+            arrived_ring_idx,
+            arrived_count,
+            step,
+            plasticity_gain);
+    }
 }
 
-void launch_stdp_stp(MemoryAllocator* alloc, int step) {
+void launch_stdp_stp(MemoryAllocator* alloc, int step, int arrived_ring_idx, int arrived_count) {
+    (void)step;
+    if (arrived_count <= 0) return;
     PersistentBuffers& b = alloc->buffers();
-    int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    int blocks = (arrived_count + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     stdp_stp_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         b.d_synapses,
-        b.d_spike_flags,
-        N_TOTAL_SYNAPSES_2E);
+        b.d_delay_ring_indices,
+        arrived_ring_idx,
+        arrived_count);
 }
 
 } // namespace stage2e

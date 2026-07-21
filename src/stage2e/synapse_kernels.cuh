@@ -28,7 +28,7 @@ namespace stage2e {
 //   当 V_bio > -20mV: NMDA 开放
 //
 // 每 thread 处理一个突触
-void launch_synapse_nmda(MemoryAllocator* alloc, int step);
+void launch_synapse_nmda(MemoryAllocator* alloc, int step, int arrived_ring_idx, int arrived_count);
 
 // STDP 双 trace (v4 强化 J, Bi & Poo 2001)
 // 输入: d_synapses (last_pre/post_spike), d_spike_flags, d_stdp_x_pre_trace
@@ -42,7 +42,8 @@ void launch_synapse_nmda(MemoryAllocator* alloc, int step);
 //   weight += η * Δw * plasticity_gain
 //   兴奋性: weight clamp 到 [0, W_MAX]
 //   抑制性: weight clamp 到 [-W_MAX, 0]
-void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_gain);
+void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_gain,
+                            int arrived_ring_idx, int arrived_count);
 
 // 短期可塑性 STP (§2.2, Tsodyks-Markram 1998)
 // 输入: d_synapses (resource, utilization), d_spike_flags (pre)
@@ -54,7 +55,7 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
 //     r_new = r * (1 - u_new) * exp(-dt/τ_rec)   (抑制)
 //     resource = r_new
 //     utilization = u_new
-void launch_stdp_stp(MemoryAllocator* alloc, int step);
+void launch_stdp_stp(MemoryAllocator* alloc, int step, int arrived_ring_idx, int arrived_count);
 
 } // namespace stage2e
 

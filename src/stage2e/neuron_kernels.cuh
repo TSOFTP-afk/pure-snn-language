@@ -26,21 +26,32 @@
 
 namespace stage2e {
 
-// 延迟环形队列每槽位最大活跃突触数 (估计每步 ~500K 活跃)
-#define DELAY_RING_SLOT_CAPACITY 500000
+struct DelayQueueRuntimeStats {
+    long long arrived_events;
+    long long dispatched_events;
+    long long dropped_events;
+    int last_arrived_events;
+    int last_dispatched_events;
+    int last_dropped_events;
+    int max_slot_depth;
+};
 
 // 把上一轮写入当前 ring_idx 槽位的延迟电流注入 input_current
-// 内部: 清零 input_current, 启动 delay_inject_kernel
+// 内部: 清零 input_current, 启动 delay_inject_kernel, 消费后清空当前槽位计数
 void launch_delay_inject(MemoryAllocator* alloc, int ring_idx);
 
 // AdEx 神经元更新 (§2.1)
 // 输入: input_current (含延迟注入 + 外部输入), nmda_current, inhibitory_current
 // 输出: neurons (V, w, refractory, fire_rate, threshold_offset), spike_flags
-void launch_lif_adex(MemoryAllocator* alloc, int step, const struct DevPhaseParams& phase);
+void launch_lif_adex(MemoryAllocator* alloc, int step, const struct DevPhaseParams& phase,
+                     int* d_single_neuron_burst_counter);
 
 // 按突触 delay_steps 把 pre 脉冲分发到环形队列
 // 内部: 清零计数器, 启动 delay_dispatch_kernel, 同步, 拷贝计数器回 host
 void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx);
+
+int delay_queue_last_arrived_events();
+const DelayQueueRuntimeStats& delay_queue_stats();
 
 } // namespace stage2e
 

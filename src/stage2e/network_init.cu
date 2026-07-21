@@ -307,14 +307,11 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
             BioSynapse& s = h_synapses[idx];
             s.pre_idx = pre;
             s.post_idx = post;
-            // 权重: 兴奋性 [0.8, 1.5], 抑制性 [-1.5, -0.8]
-            // P1 修正: 原 [0.1, 0.5] 太弱, 延迟队列注入电流无法驱动下游发放
-            // 数值推导: 11 个 active 突触 × 0.3 avg = 3.3, dV = 3.3/9.37 = 0.35 < 阈值 1.0
-            //           11 个 active 突触 × 1.15 avg = 12.6, dV = 1.35 > 阈值 ✓
+            // 权重: 兴奋性 [0.4, 1.0], 抑制性 [-1.0, -0.4]
             if (pre_is_exc) {
-                s.weight = randf(0.8f, 1.5f);
+                s.weight = randf(0.4f, 1.0f);
             } else {
-                s.weight = randf(-1.5f, -0.8f);
+                s.weight = randf(-1.0f, -0.4f);
             }
             // 延迟: 柱内 1-3, 前额叶自反馈 1-3
             uint8_t delay = static_cast<uint8_t>(randi(DELAY_INTRA_MIN, DELAY_INTRA_MAX + 1));
@@ -482,9 +479,9 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
             s.post_idx = post;
             // 前额叶自反馈 - 与柱内同量级
             if (pre_is_exc) {
-                s.weight = randf(0.8f, 1.5f);
+                s.weight = randf(0.6f, 1.2f);
             } else {
-                s.weight = randf(-1.5f, -0.8f);
+                s.weight = randf(-1.2f, -0.6f);
             }
             uint8_t delay = static_cast<uint8_t>(randi(DELAY_INTRA_MIN, DELAY_INTRA_MAX + 1));
             s.delay_steps = static_cast<float>(delay);
@@ -575,7 +572,8 @@ void init_buffers_zero(MemoryAllocator* alloc) {
     CUDA_CHECK_2E(cudaMemset(b.d_spike_flags, 0, N_TOTAL_NEURONS_2E * sizeof(bool)));
     CUDA_CHECK_2E(cudaMemset(b.d_replay_injection, 0, N_TOTAL_NEURONS_2E * sizeof(float)));
     // 延迟环形队列清零
-    CUDA_CHECK_2E(cudaMemset(b.d_delay_ring_indices, 0xFF, 20 * 500000 * sizeof(int)));  // -1 标记空槽
+    CUDA_CHECK_2E(cudaMemset(b.d_delay_ring_indices, 0xFF,
+                             DELAY_STEPS_MAX * DELAY_RING_SLOT_CAPACITY * sizeof(int)));
     CUDA_CHECK_2E(cudaMemset(b.d_delay_ring_current, 0, 20 * 500000 * sizeof(float)));
     // STDP trace 清零
     CUDA_CHECK_2E(cudaMemset(b.d_stdp_x_pre_trace, 0, N_TOTAL_SYNAPSES_2E * sizeof(float)));

@@ -25,6 +25,7 @@
 #include "neuron_kernels.cuh"
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <cuda_runtime.h>
 
 namespace stage2e {
@@ -63,6 +64,7 @@ __global__ void lif_adex_kernel(
     const float* __restrict__ input_current,
     const float* __restrict__ nmda_current,
     const float* __restrict__ inhibitory_current,
+    int* __restrict__ single_neuron_burst_counter,
     int n_neurons,
     int step,
     float plasticity_gain)
@@ -130,6 +132,9 @@ __global__ void lif_adex_kernel(
     spike_flags[i] = spike;
 
     if (spike) {
+        if (n.last_spike_time >= 0 && step - n.last_spike_time <= 5) {
+            atomicAdd(single_neuron_burst_counter, 1);
+        }
         n.last_spike_time = step;
         n.refractory_remaining = ADEX_REFRACTORY_STEPS;
         V = ADEX_V_RESET_NORM;
@@ -170,6 +175,7 @@ __global__ void delay_dispatch_kernel(
     int* delay_ring_indices,
     float* delay_ring_current,
     int* ring_write_counter,
+    int* dispatch_counts,
     int n_neurons,
     int current_ring_idx)
 {
@@ -189,12 +195,16 @@ __global__ void delay_dispatch_kernel(
 
         // atomicAdd 获取写入位置
         int write_pos = atomicAdd(&ring_write_counter[target_ring], 1);
-        if (write_pos >= DELAY_RING_SLOT_CAPACITY) continue;  // 槽位满, 丢弃
+        if (write_pos >= DELAY_RING_SLOT_CAPACITY) {
+            atomicAdd(&dispatch_counts[1], 1);
+            continue;
+        }
 
         int slot_offset = target_ring * DELAY_RING_SLOT_CAPACITY + write_pos;
         delay_ring_indices[slot_offset] = i;
         // 注入电流 = weight * resource (STP)
         delay_ring_current[slot_offset] = synapses[i].weight * synapses[i].resource;
+        atomicAdd(&dispatch_counts[0], 1);
     }
 }
 
@@ -203,13 +213,18 @@ __global__ void delay_dispatch_kernel(
 // =============================================================================
 // 全局 device 计数器缓冲 (在首次调用时分配, 生命周期 = 程序)
 static int* d_ring_write_counter = nullptr;
+static int* d_dispatch_counts = nullptr;
 static int  h_ring_counter_history[DELAY_STEPS_MAX] = {0};
+static DelayQueueRuntimeStats g_delay_stats = {0, 0, 0, 0, 0, 0, 0};
 
 static void ensure_counter_buffer() {
     if (d_ring_write_counter == nullptr) {
         cudaMalloc(&d_ring_write_counter, DELAY_STEPS_MAX * sizeof(int));
         cudaMemset(d_ring_write_counter, 0, DELAY_STEPS_MAX * sizeof(int));
+        cudaMalloc(&d_dispatch_counts, 2 * sizeof(int));
+        cudaMemset(d_dispatch_counts, 0, 2 * sizeof(int));
         memset(h_ring_counter_history, 0, sizeof(h_ring_counter_history));
+        memset(&g_delay_stats, 0, sizeof(g_delay_stats));
     }
 }
 
@@ -224,17 +239,24 @@ void launch_delay_inject(MemoryAllocator* alloc, int ring_idx) {
     cudaMemsetAsync(b.d_input_current, 0, N_TOTAL_NEURONS_2E * sizeof(float));
 
     int slot_count = h_ring_counter_history[ring_idx];
-    if (slot_count <= 0) return;
     if (slot_count > DELAY_RING_SLOT_CAPACITY) slot_count = DELAY_RING_SLOT_CAPACITY;
 
-    int blocks = (slot_count + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
-    delay_inject_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
-        b.d_input_current,
-        b.d_delay_ring_indices,
-        b.d_delay_ring_current,
-        b.d_synapses,
-        ring_idx,
-        slot_count);
+    g_delay_stats.last_arrived_events = slot_count > 0 ? slot_count : 0;
+    g_delay_stats.arrived_events += g_delay_stats.last_arrived_events;
+
+    if (slot_count > 0) {
+        int blocks = (slot_count + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+        delay_inject_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+            b.d_input_current,
+            b.d_delay_ring_indices,
+            b.d_delay_ring_current,
+            b.d_synapses,
+            ring_idx,
+            slot_count);
+    }
+
+    h_ring_counter_history[ring_idx] = 0;
+    cudaMemsetAsync(d_ring_write_counter + ring_idx, 0, sizeof(int));
 }
 
 // scheduler 在 lif_adex 之后调用:
@@ -245,8 +267,7 @@ void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx) {
     ensure_counter_buffer();
     PersistentBuffers& b = alloc->buffers();
 
-    // 清零所有 20 个槽位的计数器 (开销: 80B memset)
-    cudaMemsetAsync(d_ring_write_counter, 0, DELAY_STEPS_MAX * sizeof(int));
+    cudaMemsetAsync(d_dispatch_counts, 0, 2 * sizeof(int));
 
     int blocks = (N_TOTAL_NEURONS_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     delay_dispatch_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
@@ -257,6 +278,7 @@ void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx) {
         b.d_delay_ring_indices,
         b.d_delay_ring_current,
         d_ring_write_counter,
+        d_dispatch_counts,
         N_TOTAL_NEURONS_2E,
         ring_idx);
 
@@ -264,9 +286,23 @@ void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx) {
     cudaDeviceSynchronize();
     cudaMemcpy(h_ring_counter_history, d_ring_write_counter,
                DELAY_STEPS_MAX * sizeof(int), cudaMemcpyDeviceToHost);
+
+    int h_dispatch_counts[2] = {0, 0};
+    cudaMemcpy(h_dispatch_counts, d_dispatch_counts,
+               2 * sizeof(int), cudaMemcpyDeviceToHost);
+    g_delay_stats.last_dispatched_events = h_dispatch_counts[0];
+    g_delay_stats.last_dropped_events = h_dispatch_counts[1];
+    g_delay_stats.dispatched_events += h_dispatch_counts[0];
+    g_delay_stats.dropped_events += h_dispatch_counts[1];
+    for (int i = 0; i < DELAY_STEPS_MAX; ++i) {
+        if (h_ring_counter_history[i] > g_delay_stats.max_slot_depth) {
+            g_delay_stats.max_slot_depth = h_ring_counter_history[i];
+        }
+    }
 }
 
-void launch_lif_adex(MemoryAllocator* alloc, int step, const DevPhaseParams& phase) {
+void launch_lif_adex(MemoryAllocator* alloc, int step, const DevPhaseParams& phase,
+                     int* d_single_neuron_burst_counter) {
     PersistentBuffers& b = alloc->buffers();
     int blocks = (N_TOTAL_NEURONS_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     lif_adex_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
@@ -275,9 +311,18 @@ void launch_lif_adex(MemoryAllocator* alloc, int step, const DevPhaseParams& pha
         b.d_input_current,
         b.d_nmda_current,
         b.d_inhibitory_current,
+        d_single_neuron_burst_counter,
         N_TOTAL_NEURONS_2E,
         step,
         phase.plasticity_gain);
+}
+
+int delay_queue_last_arrived_events() {
+    return g_delay_stats.last_arrived_events;
+}
+
+const DelayQueueRuntimeStats& delay_queue_stats() {
+    return g_delay_stats;
 }
 
 } // namespace stage2e

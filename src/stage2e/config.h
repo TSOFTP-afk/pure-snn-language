@@ -56,6 +56,7 @@ static_assert(COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E + COL_MOTOR_SIZE_2E
 #define DELAY_INTER_MAX            10
 #define DELAY_LONG_MIN             15      // 长程延迟 15-20 步
 #define DELAY_LONG_MAX            20
+#define DELAY_RING_SLOT_CAPACITY   750000  // 每槽位最大活跃突触数
 
 // -----------------------------------------------------------------------------
 // AdEx 神经元参数 (v3 强化, Brette & Gerstner 2005)
@@ -128,7 +129,7 @@ static_assert(COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E + COL_MOTOR_SIZE_2E
 // P1 修正: AdEx 归一化阈值 V_norm=1.0, τ_m=9.37, 单步 dV=I/τ_m
 //   要让 V 从 0 → 1.0 单步发放, 需 I ≥ 9.37
 //   设计文档原值 1.5 严重不足 (dV=0.16), 调整为 15.0 (dV=1.6, 28% 余量)
-#define POP_CODING_GAIN           15.0f    // 输入增益 (P1 修正: 1.5→15.0)
+#define POP_CODING_GAIN           7.0f     // 输入增益
 // P1 修正: 10 步间隔导致 90% 步静默, 改为 5 步 (50% 注入密度)
 // 配合修复后的权重 [0.8, 1.5], 延迟队列可在非注入步维持活动
 #define INPUT_INJECT_INTERVAL     5        // 每 5 步注入一个新字节 (P1 修正: 10→5)
@@ -150,7 +151,7 @@ static_assert(COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E + COL_MOTOR_SIZE_2E
 #define STDP_X_POST_TAU           20.0f    // ms
 #define STDP_A_PLUS_2E            0.03f
 #define STDP_A_MINUS_2E           0.03f
-#define STDP_W_MAX_2E             1.0f
+#define STDP_W_MAX_2E             1.5f
 
 // 2 阶 eligibility trace (v3 强化 H)
 #define STDP_E1_TAU               20.0f    // 快 trace (ms)

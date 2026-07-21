@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <vector>
 
 // 解析命令行参数
@@ -66,6 +67,32 @@ static int device_count_nonzero_float(const float* d, int n) {
     int c = 0;
     for (int i = 0; i < n; ++i) if (h[i] != 0.0f) c++;
     return c;
+}
+
+static void sample_synapse_weight_stats(const stage2e::PersistentBuffers& b,
+                                        int sample_count,
+                                        float* mean_weight,
+                                        float* mean_abs_weight,
+                                        float* min_weight,
+                                        float* max_weight) {
+    if (sample_count > N_TOTAL_SYNAPSES_2E) sample_count = N_TOTAL_SYNAPSES_2E;
+    std::vector<BioSynapse> h(sample_count);
+    cudaMemcpy(h.data(), b.d_synapses, sample_count * sizeof(BioSynapse), cudaMemcpyDeviceToHost);
+    double sum = 0.0;
+    double abs_sum = 0.0;
+    float mn = h.empty() ? 0.0f : h[0].weight;
+    float mx = h.empty() ? 0.0f : h[0].weight;
+    for (int i = 0; i < sample_count; ++i) {
+        float w = h[i].weight;
+        sum += w;
+        abs_sum += fabsf(w);
+        if (w < mn) mn = w;
+        if (w > mx) mx = w;
+    }
+    *mean_weight = sample_count > 0 ? static_cast<float>(sum / sample_count) : 0.0f;
+    *mean_abs_weight = sample_count > 0 ? static_cast<float>(abs_sum / sample_count) : 0.0f;
+    *min_weight = mn;
+    *max_weight = mx;
 }
 
 int main(int argc, char** argv) {
@@ -129,7 +156,8 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[P1] 无法打开 CSV 输出: %s\n", csv_path);
         } else {
             fprintf(csv_fp, "step,spikes,is_inject_step,byte,nmda_sum,nmda_nz,"
-                            "xpre_sum,xpre_nz,ca_sum,ca_nz,weight_sum,weight_abs_sum\n");
+                            "xpre_sum,xpre_nz,ca_sum,ca_nz,weight_mean,weight_abs_mean,"
+                            "weight_min,weight_max,arrived_events,dispatched_events,dropped_events,max_slot_depth\n");
         }
     }
 
@@ -164,33 +192,23 @@ int main(int argc, char** argv) {
                 }
                 ca_sum = static_cast<float>(s); ca_nz = c;
             }
-            // 权重统计 (反映 STDP 是否在工作)
-            float wsum = 0.0f, wabs_sum = 0.0f;
-            {
-                std::vector<float> hw(n_syn);
-                cudaMemcpy(hw.data(), b.d_weights_cache, n_syn * sizeof(float), cudaMemcpyDeviceToHost);
-                // d_weights_cache 不随 STDP 更新, 用 BioSynapse.weight 更准
-                // 但 BioSynapse 是 struct, 需要按字段拷贝
-                // 简化: 用 d_weights_cache 作为初始化镜像 (不变化)
-                double s1 = 0.0, s2 = 0.0;
-                for (int i = 0; i < n_syn; ++i) {
-                    s1 += hw[i];
-                    s2 += fabsf(hw[i]);
-                }
-                wsum = static_cast<float>(s1);
-                wabs_sum = static_cast<float>(s2);
-            }
+            float wmean = 0.0f, wabs_mean = 0.0f, wmin = 0.0f, wmax = 0.0f;
+            sample_synapse_weight_stats(b, 100000, &wmean, &wabs_mean, &wmin, &wmax);
 
             bool is_inject = (step % INPUT_INJECT_INTERVAL == 0);
             uint8_t byte = is_inject ? stage2e::get_byte_for_step(step) : 0;
 
-            fprintf(csv_fp, "%d,%d,%d,%d,%.4f,%d,%.4f,%d,%.4f,%d,%.4f,%.4f\n",
+            fprintf(csv_fp, "%d,%d,%d,%d,%.4f,%d,%.4f,%d,%.4f,%d,%.6f,%.6f,%.6f,%.6f,%lld,%lld,%lld,%d\n",
                     step, scheduler.stats().total_spikes,
                     (int)is_inject, (int)byte,
                     nmda_sum, nmda_nz,
                     xpre_sum, xpre_nz,
                     ca_sum, ca_nz,
-                    wsum, wabs_sum);
+                    wmean, wabs_mean, wmin, wmax,
+                    scheduler.arrived_events_accum(),
+                    scheduler.dispatched_events_accum(),
+                    scheduler.dropped_events_accum(),
+                    scheduler.max_delay_slot_depth());
         }
 
         // P1 安全检查: 每 1000 步同步一次, 检测 kernel 错误
@@ -227,6 +245,12 @@ int main(int argc, char** argv) {
     printf("  脉冲极差:          %d\n", scheduler.spike_range());
     printf("  簇状发放步数:      %d (%.2f%%)\n",
            scheduler.total_burst_steps(), scheduler.burst_ratio());
+    printf("  单神经元burst脉冲: %d\n", scheduler.total_single_neuron_burst_spikes());
+    printf("  延迟事件到达:      %lld\n", scheduler.arrived_events_accum());
+    printf("  延迟事件分发:      %lld\n", scheduler.dispatched_events_accum());
+    printf("  延迟事件丢弃:      %lld\n", scheduler.dropped_events_accum());
+    printf("  最大槽位深度:      %d / %d\n",
+           scheduler.max_delay_slot_depth(), DELAY_RING_SLOT_CAPACITY);
     printf("  最终延迟队列位置:  %d / %d\n",
            scheduler.delay_ring_idx(), DELAY_STEPS_MAX);
 
@@ -283,6 +307,31 @@ int main(int argc, char** argv) {
     printf("  [7] 发放活动正常 (avg > 10):        %s (实际 %.1f)\n",
            active_ok ? "PASS" : "FAIL", avg_spikes);
     pass &= active_ok;
+
+    double drop_rate = scheduler.dispatched_events_accum() > 0 ?
+        static_cast<double>(scheduler.dropped_events_accum()) / scheduler.dispatched_events_accum() : 0.0;
+    bool delay_ok = (scheduler.arrived_events_accum() > 0 &&
+                     scheduler.dispatched_events_accum() > 0 &&
+                     drop_rate < 0.01);
+    printf("  [8] 延迟事件链路有效:               %s (到达 %lld, 分发 %lld, 丢弃 %lld)\n",
+           delay_ok ? "PASS" : "FAIL",
+           scheduler.arrived_events_accum(),
+           scheduler.dispatched_events_accum(),
+           scheduler.dropped_events_accum());
+    pass &= delay_ok;
+
+    bool single_burst_ok = (scheduler.total_single_neuron_burst_spikes() > 0);
+    printf("  [9] 单神经元burst出现:              %s (实际 %d)\n",
+           single_burst_ok ? "PASS" : "FAIL",
+           scheduler.total_single_neuron_burst_spikes());
+    pass &= single_burst_ok;
+
+    float final_wmean = 0.0f, final_wabs = 0.0f, final_wmin = 0.0f, final_wmax = 0.0f;
+    sample_synapse_weight_stats(allocator.buffers(), 100000, &final_wmean, &final_wabs, &final_wmin, &final_wmax);
+    bool weight_ok = (final_wmax <= STDP_W_MAX_2E + 1e-3f && final_wmin >= -STDP_W_MAX_2E - 1e-3f);
+    printf("  [10] 真实权重范围合法:              %s (min %.3f max %.3f mean %.3f)\n",
+           weight_ok ? "PASS" : "FAIL", final_wmin, final_wmax, final_wmean);
+    pass &= weight_ok;
 
     printf("============================================================\n");
     printf("  P1 总体: %s\n", pass ? "PASS ✓ 准备进入 Phase 2" : "FAIL ✗ 需调参");

@@ -61,7 +61,6 @@ __global__ void input_inject_kernel(
 void launch_input_inject(MemoryAllocator* alloc, uint8_t byte) {
     PersistentBuffers& b = alloc->buffers();
 
-    int blocks = (N_COLUMNS_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     // 每柱一个 thread, 50 柱 → 1 block (256 threads) 足够
     int threads = (N_COLUMNS_2E <= 256) ? N_COLUMNS_2E : 256;
 

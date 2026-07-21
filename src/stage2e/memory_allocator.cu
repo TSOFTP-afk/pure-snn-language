@@ -61,11 +61,10 @@ size_t MemoryAllocator::allocate_all() {
 
     // --- v4 强化 I: 突触传导延迟 ---
     d_bufs_.d_synapse_delay     = alloc<uint8_t>(N_TOTAL_SYNAPSES_2E, "d_synapse_delay", &total);
-    // 延迟环形队列 (估算每步活跃 500K 突触)
-    const size_t RING_CAPACITY = 500000;
-    d_bufs_.d_delay_ring_indices = alloc<int>((size_t)DELAY_STEPS_MAX * RING_CAPACITY,
+    // 延迟环形队列
+    d_bufs_.d_delay_ring_indices = alloc<int>((size_t)DELAY_STEPS_MAX * DELAY_RING_SLOT_CAPACITY,
                                               "d_delay_ring_indices", &total);
-    d_bufs_.d_delay_ring_current = alloc<float>((size_t)DELAY_STEPS_MAX * RING_CAPACITY,
+    d_bufs_.d_delay_ring_current = alloc<float>((size_t)DELAY_STEPS_MAX * DELAY_RING_SLOT_CAPACITY,
                                                 "d_delay_ring_current", &total);
 
     // --- v4 强化 J: STDP x_pre trace ---

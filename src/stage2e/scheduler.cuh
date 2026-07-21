@@ -83,6 +83,11 @@ public:
         return max_spikes_per_step_ - min_spikes_per_step_;
     }
     int total_burst_steps() const { return total_burst_steps_; }
+    int total_single_neuron_burst_spikes() const { return total_single_neuron_burst_spikes_; }
+    long long arrived_events_accum() const { return arrived_events_accum_; }
+    long long dispatched_events_accum() const { return dispatched_events_accum_; }
+    long long dropped_events_accum() const { return dropped_events_accum_; }
+    int max_delay_slot_depth() const { return max_delay_slot_depth_; }
     float burst_ratio() const {
         return total_steps_ > 0 ? (100.0f * total_burst_steps_ / total_steps_) : 0.0f;
     }
@@ -100,9 +105,15 @@ private:
     int min_spikes_per_step_;
     int max_spikes_per_step_;
     int total_burst_steps_;  // 簇状发放步数
+    int total_single_neuron_burst_spikes_;
+    long long arrived_events_accum_;
+    long long dispatched_events_accum_;
+    long long dropped_events_accum_;
+    int max_delay_slot_depth_;
 
     // device 端 spike 计数器 (用于 atomicAdd 统计)
     int* d_spike_counter_;
+    int* d_single_neuron_burst_counter_;
 
     // --- P1 占位 kernel 启动器 (中/慢时间尺度, Phase 2-4 实现) ---
     void launch_camkii_kernel(int step);

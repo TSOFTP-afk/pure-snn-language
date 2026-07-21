@@ -39,18 +39,23 @@ BioMechanismScheduler::BioMechanismScheduler(MemoryAllocator* alloc)
     : alloc_(alloc), stats_{}, delay_ring_idx_(0),
       total_steps_(0), total_spikes_accum_(0), inject_spikes_accum_(0),
       min_spikes_per_step_(INT_MAX), max_spikes_per_step_(0),
-      total_burst_steps_(0) {
+      total_burst_steps_(0), total_single_neuron_burst_spikes_(0),
+      arrived_events_accum_(0), dispatched_events_accum_(0),
+      dropped_events_accum_(0), max_delay_slot_depth_(0) {
     printf("[Stage2e P1] 调度器初始化完成\n");
     memset(&stats_, 0, sizeof(stats_));
     // 分配 device 端 spike 计数器
     cudaMalloc(&d_spike_counter_, sizeof(int));
     cudaMemset(d_spike_counter_, 0, sizeof(int));
+    cudaMalloc(&d_single_neuron_burst_counter_, sizeof(int));
+    cudaMemset(d_single_neuron_burst_counter_, 0, sizeof(int));
 }
 
 BioMechanismScheduler::~BioMechanismScheduler() {
     printf("[Stage2e P1] 调度器销毁, 共执行 %d 步, 累计脉冲 %d\n",
            total_steps_, total_spikes_accum_);
     if (d_spike_counter_) cudaFree(d_spike_counter_);
+    if (d_single_neuron_burst_counter_) cudaFree(d_single_neuron_burst_counter_);
 }
 
 void BioMechanismScheduler::step(int current_step) {
@@ -62,6 +67,8 @@ void BioMechanismScheduler::step(int current_step) {
 
     // 1. 延迟队列注入 (清零 input_current + 注入上一轮 ring_idx 槽位的内容)
     launch_delay_inject(alloc_, delay_ring_idx_);
+    int arrived_ring_idx = delay_ring_idx_;
+    int arrived_count = delay_queue_last_arrived_events();
 
     // 2. 群体编码输入注入 (每 INPUT_INJECT_INTERVAL 步注入一个字节)
     if (current_step % INPUT_INJECT_INTERVAL == 0) {
@@ -70,16 +77,18 @@ void BioMechanismScheduler::step(int current_step) {
     }
 
     // 3. AdEx 神经元更新 (产生 spike_flags)
-    launch_lif_adex(alloc_, current_step, phase);
+    cudaMemsetAsync(d_single_neuron_burst_counter_, 0, sizeof(int));
+    launch_lif_adex(alloc_, current_step, phase, d_single_neuron_burst_counter_);
 
-    // 4. NMDA 受体 + 钙浓度 (消耗 spike_flags, 更新 nmda_current)
-    launch_synapse_nmda(alloc_, current_step);
+    // 4. NMDA 受体 + 钙浓度 (pre 侧由延迟到达事件驱动)
+    launch_synapse_nmda(alloc_, current_step, arrived_ring_idx, arrived_count);
 
-    // 5. STDP 双 trace + Δw (消耗 spike_flags, 更新 weight)
-    launch_stdp_dual_trace(alloc_, current_step, phase.plasticity_gain);
+    // 5. STDP 双 trace + Δw (pre 侧由延迟到达事件驱动)
+    launch_stdp_dual_trace(alloc_, current_step, phase.plasticity_gain,
+                           arrived_ring_idx, arrived_count);
 
-    // 6. STP 短期可塑性 (消耗 spike_flags, 更新 resource/utilization)
-    launch_stdp_stp(alloc_, current_step);
+    // 6. STP 短期可塑性 (由延迟到达事件驱动)
+    launch_stdp_stp(alloc_, current_step, arrived_ring_idx, arrived_count);
 
     // 7. 延迟队列分发 (扫描 spike_flags, 写入 ring[target_ring])
     launch_delay_dispatch(alloc_, current_step, delay_ring_idx_);
@@ -128,12 +137,21 @@ void BioMechanismScheduler::step(int current_step) {
 
     int step_spikes = 0;
     cudaMemcpy(&step_spikes, d_spike_counter_, sizeof(int), cudaMemcpyDeviceToHost);
+    int step_single_burst = 0;
+    cudaMemcpy(&step_single_burst, d_single_neuron_burst_counter_, sizeof(int), cudaMemcpyDeviceToHost);
 
     total_steps_++;
     total_spikes_accum_ += step_spikes;
+    total_single_neuron_burst_spikes_ += step_single_burst;
     stats_.total_spikes = step_spikes;
     stats_.vram_used_bytes = alloc_->vram_used();
     stats_.vram_peak_bytes = alloc_->vram_peak();
+
+    const DelayQueueRuntimeStats& dq = delay_queue_stats();
+    arrived_events_accum_ = dq.arrived_events;
+    dispatched_events_accum_ = dq.dispatched_events;
+    dropped_events_accum_ = dq.dropped_events;
+    max_delay_slot_depth_ = dq.max_slot_depth;
 
     // P1 判据: spike count 极差 + 簇状发放
     if (step_spikes < min_spikes_per_step_) min_spikes_per_step_ = step_spikes;
@@ -231,11 +249,11 @@ void BioMechanismScheduler::print_step_log(int step) {
     const char* phase_names[] = {"EMBRYONIC", "SYNAPTOGENIC", "CRITICAL", "PRUNING", "MATURE"};
 
     printf("[Stage2e P1] step=%6d  phase=%-12s  plast_gain=%.2f  nmda_expr=%.2f  "
-           "vram=%.1fMB  spikes=%d  ring=%d  burst%%=%.1f\n",
+           "vram=%.1fMB  spikes=%d  ring=%d  arrived=%d  burst%%=%.1f\n",
            step, phase_names[static_cast<int>(ph)],
            pp.plasticity_gain, pp.nmda_expression,
            stats_.vram_used_bytes / (1024.0 * 1024.0),
-           stats_.total_spikes, delay_ring_idx_,
+           stats_.total_spikes, delay_ring_idx_, delay_queue_stats().last_arrived_events,
            total_steps_ > 0 ? (100.0f * total_burst_steps_ / total_steps_) : 0.0f);
 }
 
