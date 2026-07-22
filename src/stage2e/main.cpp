@@ -17,6 +17,7 @@
 #include "network_init.cuh"
 #include "input_encoding.cuh"
 #include "modulatory_kernels.cuh"
+#include "synapse_kernels.cuh"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -31,14 +32,22 @@ static int parse_steps(int argc, char** argv) {
             steps = atoi(argv[i + 1]);
             ++i;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: snn_stage2e_p1 [--steps N] [--csv PATH] [--help]\n");
+            printf("Usage: snn_stage2e_p1 [--steps N] [--csv PATH] [--e0] [--help]\n");
             printf("  --steps N   运行 N 步 (默认 %d)\n", SMOKE_TEST_STEPS_2E);
             printf("  --csv PATH  每步输出 spike 序列到 CSV (评估模式)\n");
+            printf("  --e0        E0 消融模式 (纯 STDP 基线, 关闭三因素+CaMKII+调质)\n");
             printf("  --help      显示帮助\n");
             exit(0);
         }
     }
     return steps;
+}
+
+static bool parse_e0_flag(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--e0") == 0) return true;
+    }
+    return false;
 }
 
 static const char* get_csv_path(int argc, char** argv) {
@@ -151,6 +160,15 @@ int main(int argc, char** argv) {
 
     // --- 4. 调度器初始化 ---
     stage2e::BioMechanismScheduler scheduler(&allocator);
+
+    // E0 消融模式: 纯 STDP 基线 (关闭三因素调制 + CaMKII + 调质系统)
+    bool e0_mode = parse_e0_flag(argc, argv);
+    if (e0_mode) {
+        scheduler.e0_ablation = true;
+        printf("  *** E0 消融模式: 纯 STDP 基线 (无三因素/CaMKII/调质) ***\n");
+        stage2e::set_e0_ablation(true);
+        printf("  *** E0 scheduler.e0_ablation = true ***\n\n");
+    }
 
     // --- 5. 主循环 ---
     const char* csv_path = get_csv_path(argc, argv);
@@ -439,10 +457,12 @@ int main(int argc, char** argv) {
     // 对每个神经元 i, 用卡方检验判断其对 256 个字节的发放是否有选择性
     // H0: 神经元对所有字节发放率相同; H1: 对某些字节有选择性
     // df = 255, p < 0.05 临界值 ≈ 293.2 (查 chi-square 表)
+    //
+    // 分层分析: sensory (直接受输入驱动) vs association/motor/prefrontal (间接学习)
+    // 后者才是突触学习效果的真正证据
     {
-        const int N = N_TOTAL_NEURONS_2E;
         const int B = 256;
-        const int total_neurons = N;
+        const int total_neurons = N_TOTAL_NEURONS_2E;
         const int total_bytes = B;
 
         // 拷贝 neuron_byte_counts 到 host (55K × 256 × 4B = 56 MB)
@@ -452,53 +472,76 @@ int main(int argc, char** argv) {
                    cudaMemcpyDeviceToHost);
 
         // 计算每个字节的注入次数 (应该相等, 但用实际值更安全)
-        // 总注入次数 = total_steps / INPUT_INJECT_INTERVAL
         int total_injections = total_steps / INPUT_INJECT_INTERVAL;
         std::vector<int> injections_per_byte(total_bytes, 0);
         for (int b = 0; b < total_bytes; ++b) {
             injections_per_byte[b] = total_injections / total_bytes;
         }
-        // 总注入次数 (用 injections_per_byte 之和)
         double total_inj_sum = 0.0;
         for (int b = 0; b < total_bytes; ++b) total_inj_sum += injections_per_byte[b];
 
-        // 卡方检验 (df=255, p<0.05 临界值 ≈ 293.2)
-        // χ²_i = Σ_b (N_ib - E_ib)² / E_ib
-        // E_ib = (Σ_b N_ib) × (injections_b / total_inj_sum)
         const double chi2_critical = 293.2;  // df=255, p=0.05
-        int significant_neurons = 0;
-        int active_neurons = 0;  // 至少有 1 次 spike 的神经元
-        double chi2_sum = 0.0;
-        double chi2_max = 0.0;
 
-        for (int i = 0; i < total_neurons; ++i) {
-            // 该神经元所有字节的总 spike 数
-            int row_total = 0;
-            for (int b = 0; b < total_bytes; ++b) {
-                row_total += h_counts[(size_t)i * total_bytes + b];
+        // 分层统计: sensory / association / motor / prefrontal
+        // sensory: [0, N_SENSORY_TOTAL_2E)                         = [0, 10000)
+        // association: [N_SENSORY_TOTAL_2E, N_SENSORY_TOTAL_2E + N_ASSOC_TOTAL_2E) = [10000, 40000)
+        // motor: [N_SENSORY_TOTAL_2E + N_ASSOC_TOTAL_2E, N_ASSOCIATION_NEURONS_2E) = [40000, 50000)
+        // prefrontal: [N_ASSOCIATION_NEURONS_2E, N_TOTAL_NEURONS_2E) = [50000, 55000)
+        struct LayerRange { const char* name; int start; int end; };
+        LayerRange layers[] = {
+            {"sensory    ", 0,                                  N_SENSORY_TOTAL_2E},
+            {"association", N_SENSORY_TOTAL_2E,                 N_SENSORY_TOTAL_2E + N_ASSOC_TOTAL_2E},
+            {"motor      ", N_SENSORY_TOTAL_2E + N_ASSOC_TOTAL_2E, N_ASSOCIATION_NEURONS_2E},
+            {"prefrontal ", N_ASSOCIATION_NEURONS_2E,           N_TOTAL_NEURONS_2E},
+        };
+
+        int total_significant = 0;
+        int total_active = 0;
+        double total_chi2_sum = 0.0;
+        double total_chi2_max = 0.0;
+
+        printf("  [16] 卡方显著神经元分层分析 (df=255, 临界=%.1f):\n", chi2_critical);
+        printf("       %-14s %8s %8s %10s %10s %10s\n",
+               "层级", "显著", "活跃", "活跃%", "卡方均值", "卡方最大");
+
+        for (const auto& layer : layers) {
+            int sig = 0, act = 0;
+            double chi2_sum = 0.0, chi2_max = 0.0;
+            for (int i = layer.start; i < layer.end; ++i) {
+                int row_total = 0;
+                for (int b = 0; b < total_bytes; ++b) {
+                    row_total += h_counts[(size_t)i * total_bytes + b];
+                }
+                if (row_total < 10) continue;
+                act++;
+
+                double chi2 = 0.0;
+                for (int b = 0; b < total_bytes; ++b) {
+                    double expected = (double)row_total * injections_per_byte[b] / total_inj_sum;
+                    if (expected < 1e-10) continue;
+                    double diff = (double)h_counts[(size_t)i * total_bytes + b] - expected;
+                    chi2 += diff * diff / expected;
+                }
+                chi2_sum += chi2;
+                if (chi2 > chi2_max) chi2_max = chi2;
+                if (chi2 > chi2_critical) sig++;
             }
-            if (row_total < 10) continue;  // 太少不检验
-            active_neurons++;
-
-            // 计算卡方统计量
-            double chi2 = 0.0;
-            for (int b = 0; b < total_bytes; ++b) {
-                double expected = (double)row_total * injections_per_byte[b] / total_inj_sum;
-                if (expected < 1e-10) continue;
-                double diff = (double)h_counts[(size_t)i * total_bytes + b] - expected;
-                chi2 += diff * diff / expected;
-            }
-
-            chi2_sum += chi2;
-            if (chi2 > chi2_max) chi2_max = chi2;
-            if (chi2 > chi2_critical) significant_neurons++;
+            double chi2_mean = act > 0 ? chi2_sum / act : 0.0;
+            int layer_size = layer.end - layer.start;
+            double active_pct = layer_size > 0 ? 100.0 * act / layer_size : 0.0;
+            printf("       %-14s %8d %8d %9.1f%% %10.1f %10.1f\n",
+                   layer.name, sig, act, active_pct, chi2_mean, chi2_max);
+            total_significant += sig;
+            total_active += act;
+            total_chi2_sum += chi2_sum;
+            if (chi2_max > total_chi2_max) total_chi2_max = chi2_max;
         }
 
-        double chi2_mean = active_neurons > 0 ? chi2_sum / active_neurons : 0.0;
-        bool chi2_ok = (significant_neurons > 500);
-        printf("  [16] 卡方显著神经元 > 500:        %s (显著=%d/%d 活跃, 临界=%.1f, 均值=%.1f, 最大=%.1f)\n",
-               chi2_ok ? "PASS" : "FAIL", significant_neurons, active_neurons,
-               chi2_critical, chi2_mean, chi2_max);
+        double total_chi2_mean = total_active > 0 ? total_chi2_sum / total_active : 0.0;
+        bool chi2_ok = (total_significant > 500);
+        printf("  [16] 卡方显著神经元 > 500:        %s (总显著=%d/%d 活跃, 均值=%.1f, 最大=%.1f)\n",
+               chi2_ok ? "PASS" : "FAIL", total_significant, total_active,
+               total_chi2_mean, total_chi2_max);
         pass &= chi2_ok;
     }
 

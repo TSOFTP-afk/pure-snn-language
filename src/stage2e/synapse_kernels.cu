@@ -36,6 +36,9 @@
 
 namespace stage2e {
 
+// E0 消融模式 device 开关 (host 端通过 set_e0_ablation 设置)
+__device__ bool g_e0_ablation = false;
+
 // =============================================================================
 // synapse_nmda_kernel: NMDA 受体电压依赖 + 钙浓度更新
 // =============================================================================
@@ -164,19 +167,27 @@ __global__ void stdp_dual_trace_kernel(
         s.last_post_spike = static_cast<float>(step);
     }
 
-    // ----- 4. 应用权重更新 (P2: 三因素调制) -----
-    // Δw_final = η · STDP_delta · M_ij(t) · plasticity_factor
-    // M_ij = σ(da_receptor·DA + ach_receptor·ACh + ne_receptor·NE + ht5_receptor·5HT)
-    // plasticity_factor = 1.0 - 0.5·autophosph (CaMKII 巩固)
-    float M_ij = 1.0f / (1.0f + expf(-(s.da_receptor * da_conc[post]
-                                       + s.ach_receptor * ach_conc[post]
-                                       + get_ne_receptor(s) * ne_conc[post]
-                                       + get_ht5_receptor(s) * ht5_conc[post])));
-    float plasticity_factor = 1.0f - 0.5f * s.camkii_autophosph;
+    // ----- 4. 应用权重更新 -----
+    // E0 消融: 纯 STDP (M_ij=1, plasticity_factor=1)
+    // P2 完整: Δw_final = η · STDP_delta · M_ij(t) · plasticity_factor
+    //   M_ij = σ(da_receptor·DA + ach_receptor·ACh + ne_receptor·NE + ht5_receptor·5HT)
+    //   plasticity_factor = 1.0 - 0.5·autophosph (CaMKII 巩固)
+    float M_ij, plasticity_factor;
+    if (g_e0_ablation) {
+        M_ij = 1.0f;
+        plasticity_factor = 1.0f;
+    } else {
+        M_ij = 1.0f / (1.0f + expf(-(s.da_receptor * da_conc[post]
+                                     + s.ach_receptor * ach_conc[post]
+                                     + get_ne_receptor(s) * ne_conc[post]
+                                     + get_ht5_receptor(s) * ht5_conc[post])));
+        plasticity_factor = 1.0f - 0.5f * s.camkii_autophosph;
+    }
     float eta = 0.01f;
     s.weight += eta * delta_w * plasticity_gain * M_ij * plasticity_factor;
 
     // P2: 累积 STDP delta 到 eligibility (供 stdp_eligibility_kernel 吸收)
+    // E0 模式也累积, 但 eligibility kernel 不运行 (scheduler 跳过)
     s.eligibility += delta_w;
 
     // ----- 5. 权重 clamp -----
@@ -221,12 +232,18 @@ __global__ void stdp_arrival_pre_kernel(
     s.x_pre_trace += STDP_A_PLUS_2E;
     s.last_pre_spike = static_cast<float>(step);
 
-    // P2: 三因素调制
-    float M_ij = 1.0f / (1.0f + expf(-(s.da_receptor * da_conc[post]
-                                       + s.ach_receptor * ach_conc[post]
-                                       + get_ne_receptor(s) * ne_conc[post]
-                                       + get_ht5_receptor(s) * ht5_conc[post])));
-    float plasticity_factor = 1.0f - 0.5f * s.camkii_autophosph;
+    // P2: 三因素调制 (E0 消融模式下跳过)
+    float M_ij, plasticity_factor;
+    if (g_e0_ablation) {
+        M_ij = 1.0f;
+        plasticity_factor = 1.0f;
+    } else {
+        M_ij = 1.0f / (1.0f + expf(-(s.da_receptor * da_conc[post]
+                                     + s.ach_receptor * ach_conc[post]
+                                     + get_ne_receptor(s) * ne_conc[post]
+                                     + get_ht5_receptor(s) * ht5_conc[post])));
+        plasticity_factor = 1.0f - 0.5f * s.camkii_autophosph;
+    }
     float eta = 0.01f;
     s.weight += eta * delta_w * plasticity_gain * M_ij * plasticity_factor;
 
@@ -511,6 +528,16 @@ void launch_synaptic_scaling(MemoryAllocator* alloc, int step, float target_fr) 
     // alpha = 0.5 (温和缩放)
     synaptic_scaling_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         b.d_synapses, b.d_neurons, N_TOTAL_SYNAPSES_2E, target_fr, 0.5f);
+}
+
+// E0 消融模式: 设置 device 开关
+void set_e0_ablation(bool enable) {
+    cudaError_t err = cudaMemcpyToSymbol(g_e0_ablation, &enable, sizeof(bool));
+    if (err != cudaSuccess) {
+        printf("[E0] cudaMemcpyToSymbol 失败: %s\n", cudaGetErrorString(err));
+    } else {
+        printf("[E0] device 开关已设置: g_e0_ablation = %s\n", enable ? "true" : "false");
+    }
 }
 
 } // namespace stage2e

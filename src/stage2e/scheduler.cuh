@@ -67,6 +67,9 @@ public:
     BioMechanismScheduler(MemoryAllocator* alloc);
     ~BioMechanismScheduler();
 
+    // E0 消融模式: 关闭三因素调制 + CaMKII + 调质系统 (纯 STDP 基线)
+    bool e0_ablation = false;
+
     // 主步进函数
     void step(int current_step);
 

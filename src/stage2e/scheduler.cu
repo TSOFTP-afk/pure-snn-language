@@ -127,18 +127,24 @@ void BioMechanismScheduler::step(int current_step) {
         buf.d_inhibitory_current, N_TOTAL_NEURONS_2E);
 
     // ==================== 中时间尺度 (每 10 步) ====================
-    // P1 占位 (Phase 2 实现): camkii, eligibility, inhibitory_network
+    // P2 实现: camkii, eligibility, inhibitory_network
+    // E0 消融模式: 跳过 CaMKII 和 eligibility (保留 inhibitory 占位)
     if (current_step % 10 == 0) {
-        launch_camkii_kernel(current_step);
-        launch_stdp_eligibility(current_step);
+        if (!e0_ablation) {
+            launch_camkii_kernel(current_step);
+            launch_stdp_eligibility(current_step);
+        }
         launch_inhibitory_network(current_step);
     }
 
     // ==================== 慢时间尺度 (每 100 步) ====================
-    // P1 占位 (Phase 2-3 实现): modulatory, scaling, wm_update
+    // P2 实现: modulatory, scaling, wm_update
+    // E0 消融模式: 跳过 modulatory 和 scaling (纯 STDP 不含调质和缩放)
     if (current_step % 100 == 0) {
-        launch_modulatory(current_step);
-        launch_scaling(current_step);
+        if (!e0_ablation) {
+            launch_modulatory(current_step);
+            launch_scaling(current_step);
+        }
         launch_wm_update(current_step);
     }
 

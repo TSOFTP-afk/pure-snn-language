@@ -78,6 +78,9 @@ void launch_stdp_eligibility(MemoryAllocator* alloc, int step);
 // w_ij *= scale_i · clamp(scale_j / scale_i, 0.5, 2.0)
 void launch_synaptic_scaling(MemoryAllocator* alloc, int step, float target_fr);
 
+// E0 消融模式: 设置 device 开关 (关闭三因素调制 + CaMKII)
+void set_e0_ablation(bool enable);
+
 } // namespace stage2e
 
 #endif // SNN_STAGE2E_SYNAPSE_KERNELS_CUH
