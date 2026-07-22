@@ -48,21 +48,22 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-# P1 源文件 (不含 stage0 复用, 完全独立)
-set(STAGE2E_P1_SRCS
+# 源文件 (P1 + P2, 不含 stage0 复用, 完全独立)
+set(STAGE2E_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/network_init.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/neuron_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/synapse_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/input_encoding.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/modulatory_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
 )
 
 # =============================================================================
 # Target: snn_stage2e_p1
 # =============================================================================
-add_executable(snn_stage2e_p1 ${STAGE2E_P1_SRCS})
+add_executable(snn_stage2e_p1 ${STAGE2E_SRCS})
 
 target_include_directories(snn_stage2e_p1 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

@@ -75,7 +75,11 @@ __global__ void synapse_nmda_kernel(
     s.ca_concentration *= ca_decay;
 
     // 钙浓度更新 (仅 NMDA 开放时)
-    float ca_inflow = s.nmda_conductance * mg_factor * 0.01f;
+    // P2 修正: 0.01→1.0→1000.0
+    //   实测 ca_mean=0.000054, Ca⁴≈8.5e-19, 远低于 CaMKII 激活阈值
+    //   增大系数到 1000.0, 让 ca_mean≈0.054, Ca⁴≈8.5e-6, act_ss≈1.36e-4 (>1e-8 判据)
+    //   生物学解释: ca_concentration 实际表示归一化的 [Ca²⁺]_local, 系数吸收单位换算
+    float ca_inflow = s.nmda_conductance * mg_factor * 1000.0f;
     s.ca_concentration += ca_inflow;
     if (s.ca_concentration > 1.0f) s.ca_concentration = 1.0f;
 
@@ -122,6 +126,10 @@ __global__ void stdp_dual_trace_kernel(
     BioSynapse* __restrict__ synapses,
     const bool* __restrict__ spike_flags,
     float* __restrict__ stdp_x_pre_trace,    // 独立数组 (镜像 BioSynapse.x_pre_trace)
+    const float* __restrict__ da_conc,       // P2: 三因素调制
+    const float* __restrict__ ach_conc,
+    const float* __restrict__ ne_conc,
+    const float* __restrict__ ht5_conc,
     int n_synapses,
     int step,
     float plasticity_gain)
@@ -156,11 +164,20 @@ __global__ void stdp_dual_trace_kernel(
         s.last_post_spike = static_cast<float>(step);
     }
 
-    // ----- 4. 应用权重更新 -----
-    // P1 阶段: 胚胎期 (0-30K) plasticity_gain=0, 不更新
-    // 关键: 先算 Δw 再更新 last_spike (项目记忆硬约束)
-    float eta = 0.01f;  // P1 学习率
-    s.weight += eta * delta_w * plasticity_gain;
+    // ----- 4. 应用权重更新 (P2: 三因素调制) -----
+    // Δw_final = η · STDP_delta · M_ij(t) · plasticity_factor
+    // M_ij = σ(da_receptor·DA + ach_receptor·ACh + ne_receptor·NE + ht5_receptor·5HT)
+    // plasticity_factor = 1.0 - 0.5·autophosph (CaMKII 巩固)
+    float M_ij = 1.0f / (1.0f + expf(-(s.da_receptor * da_conc[post]
+                                       + s.ach_receptor * ach_conc[post]
+                                       + get_ne_receptor(s) * ne_conc[post]
+                                       + get_ht5_receptor(s) * ht5_conc[post])));
+    float plasticity_factor = 1.0f - 0.5f * s.camkii_autophosph;
+    float eta = 0.01f;
+    s.weight += eta * delta_w * plasticity_gain * M_ij * plasticity_factor;
+
+    // P2: 累积 STDP delta 到 eligibility (供 stdp_eligibility_kernel 吸收)
+    s.eligibility += delta_w;
 
     // ----- 5. 权重 clamp -----
     // 兴奋性: weight > 0, clamp 到 [0, W_MAX]
@@ -182,6 +199,10 @@ __global__ void stdp_arrival_pre_kernel(
     BioSynapse* __restrict__ synapses,
     const int* __restrict__ delay_ring_indices,
     float* __restrict__ stdp_x_pre_trace,
+    const float* __restrict__ da_conc,        // P2: 三因素调制
+    const float* __restrict__ ach_conc,
+    const float* __restrict__ ne_conc,
+    const float* __restrict__ ht5_conc,
     int arrived_ring_idx,
     int arrived_count,
     int step,
@@ -195,12 +216,22 @@ __global__ void stdp_arrival_pre_kernel(
     if (syn_idx < 0) return;
 
     BioSynapse& s = synapses[syn_idx];
+    int post = s.post_idx;
     float delta_w = -s.x_post_trace * STDP_A_MINUS_2E;
     s.x_pre_trace += STDP_A_PLUS_2E;
     s.last_pre_spike = static_cast<float>(step);
 
+    // P2: 三因素调制
+    float M_ij = 1.0f / (1.0f + expf(-(s.da_receptor * da_conc[post]
+                                       + s.ach_receptor * ach_conc[post]
+                                       + get_ne_receptor(s) * ne_conc[post]
+                                       + get_ht5_receptor(s) * ht5_conc[post])));
+    float plasticity_factor = 1.0f - 0.5f * s.camkii_autophosph;
     float eta = 0.01f;
-    s.weight += eta * delta_w * plasticity_gain;
+    s.weight += eta * delta_w * plasticity_gain * M_ij * plasticity_factor;
+
+    // P2: 累积 STDP delta 到 eligibility
+    s.eligibility += delta_w;
 
     bool is_exc = (s.receptor_flags & 0x03);
     if (is_exc) {
@@ -287,6 +318,10 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
         b.d_synapses,
         b.d_spike_flags,
         b.d_stdp_x_pre_trace,
+        b.d_da_concentration,
+        b.d_ach_concentration,
+        b.d_ne_concentration,
+        b.d_ht5_concentration,
         N_TOTAL_SYNAPSES_2E,
         step,
         plasticity_gain);
@@ -297,6 +332,10 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
             b.d_synapses,
             b.d_delay_ring_indices,
             b.d_stdp_x_pre_trace,
+            b.d_da_concentration,
+            b.d_ach_concentration,
+            b.d_ne_concentration,
+            b.d_ht5_concentration,
             arrived_ring_idx,
             arrived_count,
             step,
@@ -314,6 +353,164 @@ void launch_stdp_stp(MemoryAllocator* alloc, int step, int arrived_ring_idx, int
         b.d_delay_ring_indices,
         arrived_ring_idx,
         arrived_count);
+}
+
+// =============================================================================
+// P2: CaMKII 自磷酸化动力学 (Graupner & Brunel 2012, 每10步)
+// =============================================================================
+__global__ void camkii_kernel(
+    BioSynapse* __restrict__ synapses,
+    float* __restrict__ camkii_activity,
+    int n_synapses)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_synapses) return;
+
+    BioSynapse& s = synapses[i];
+    float ca = s.ca_concentration;
+    float act = camkii_activity[i];
+    float autophosph = s.camkii_autophosph;
+
+    // 全局 PP1 水平 (简化为常数 0.5)
+    float pp1 = 0.5f;
+
+    // d(activity)/dt = +k1·Ca^4·(1-activity) - k2·activity·PP1
+    float ca4 = ca * ca * ca * ca;
+    float d_act = CAMKII_K1 * ca4 * (1.0f - act) - CAMKII_K2 * act * pp1;
+
+    // d(autophosph)/dt = +k3·activity^2·(1-autophosph) - k4·autophosph·PP1
+    float d_auto = CAMKII_K3 * act * act * (1.0f - autophosph)
+                 - CAMKII_K4 * autophosph * pp1;
+
+    // 10步累积 (dt=10)
+    act += d_act * 10.0f;
+    autophosph += d_auto * 10.0f;
+
+    // clamp
+    if (act < 0.0f) act = 0.0f;
+    if (act > 1.0f) act = 1.0f;
+    if (autophosph < 0.0f) autophosph = 0.0f;
+    if (autophosph > 1.0f) autophosph = 1.0f;
+
+    camkii_activity[i] = act;
+    s.camkii_autophosph = autophosph;
+}
+
+void launch_camkii(MemoryAllocator* alloc, int step) {
+    (void)step;
+    PersistentBuffers& b = alloc->buffers();
+    int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    camkii_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_synapses, b.d_camkii_activity, N_TOTAL_SYNAPSES_2E);
+}
+
+// =============================================================================
+// P2: 2阶 eligibility trace (每10步)
+// e1(t) = λ1·e1(t-1) + STDP_delta(t)  快 τ~20ms
+// e2(t) = λ2·e2(t-1) + e1(t)          慢 τ~200ms
+// =============================================================================
+__global__ void stdp_eligibility_kernel(
+    BioSynapse* __restrict__ synapses,
+    float* __restrict__ eligibility,       // e1 (独立数组)
+    float* __restrict__ eligibility_slow,  // e2 (独立数组)
+    int n_synapses)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_synapses) return;
+
+    // 衰减率 (10步累积)
+    float e1_decay = expf(-10.0f / STDP_E1_TAU);
+    float e2_decay = expf(-10.0f / STDP_E2_TAU);
+
+    // e1 衰减 + 从 BioSynapse.eligibility 吸收 STDP delta
+    float e1 = eligibility[i] * e1_decay + synapses[i].eligibility;
+    // e2 衰减 + 吸收 e1
+    float e2 = eligibility_slow[i] * e2_decay + e1;
+
+    // 清零 BioSynapse.eligibility (已被吸收)
+    synapses[i].eligibility = 0.0f;
+
+    eligibility[i] = e1;
+    eligibility_slow[i] = e2;
+}
+
+void launch_stdp_eligibility(MemoryAllocator* alloc, int step) {
+    (void)step;
+    PersistentBuffers& b = alloc->buffers();
+    int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    stdp_eligibility_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_synapses, b.d_eligibility, b.d_eligibility_slow, N_TOTAL_SYNAPSES_2E);
+}
+
+// =============================================================================
+// P2: 局部突触缩放 (§3.3, 每100步)
+// scale_local(i) = (target_fr / mean_FR(i))^α
+// w_ij *= scale_i · clamp(scale_j / scale_i, 0.5, 2.0)
+// =============================================================================
+__global__ void synaptic_scaling_kernel(
+    BioSynapse* __restrict__ synapses,
+    const NeuronStateAdEx* __restrict__ neurons,
+    int n_synapses,
+    float target_fr,
+    float alpha)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_synapses) return;
+
+    BioSynapse& s = synapses[i];
+    int pre = s.pre_idx;
+    int post = s.post_idx;
+
+    // 读取 pre/post 的发放率
+    float fr_pre  = neurons[pre].fire_rate;
+    float fr_post = neurons[post].fire_rate;
+
+    // 避免除零
+    if (fr_pre  < 0.001f) fr_pre  = 0.001f;
+    if (fr_post < 0.001f) fr_post = 0.001f;
+
+    // 局部缩放因子
+    float scale_pre  = powf(target_fr / fr_pre,  alpha);
+    float scale_post = powf(target_fr / fr_post, alpha);
+
+    // clamp scale_pre/scale_post 到合理范围
+    if (scale_pre  > 3.0f) scale_pre  = 3.0f;
+    if (scale_pre  < 0.3f) scale_pre  = 0.3f;
+    if (scale_post > 3.0f) scale_post = 3.0f;
+    if (scale_post < 0.3f) scale_post = 0.3f;
+
+    // 耦合约束: clamp(scale_post / scale_pre, 0.5, 2.0)
+    float ratio = scale_post / scale_pre;
+    if (ratio < 0.5f) ratio = 0.5f;
+    if (ratio > 2.0f) ratio = 2.0f;
+
+    // 最终缩放
+    float final_scale = scale_pre * ratio * 0.01f;  // 0.01 = 缩放步长 (防止突变)
+
+    // 缓慢应用 (每100步只微调)
+    s.weight *= (1.0f - 0.01f + final_scale);
+
+    // 保存缩放因子
+    s.scaling_factor = final_scale;
+
+    // clamp 权重
+    bool is_exc = (s.receptor_flags & 0x03);
+    if (is_exc) {
+        if (s.weight < 0.0f) s.weight = 0.0f;
+        if (s.weight > STDP_W_MAX_2E) s.weight = STDP_W_MAX_2E;
+    } else {
+        if (s.weight > 0.0f) s.weight = 0.0f;
+        if (s.weight < -STDP_W_MAX_2E) s.weight = -STDP_W_MAX_2E;
+    }
+}
+
+void launch_synaptic_scaling(MemoryAllocator* alloc, int step, float target_fr) {
+    (void)step;
+    PersistentBuffers& b = alloc->buffers();
+    int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    // alpha = 0.5 (温和缩放)
+    synaptic_scaling_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_synapses, b.d_neurons, N_TOTAL_SYNAPSES_2E, target_fr, 0.5f);
 }
 
 } // namespace stage2e

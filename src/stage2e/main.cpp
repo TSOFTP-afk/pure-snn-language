@@ -16,6 +16,7 @@
 #include "scheduler.cuh"
 #include "network_init.cuh"
 #include "input_encoding.cuh"
+#include "modulatory_kernels.cuh"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -333,8 +334,107 @@ int main(int argc, char** argv) {
            weight_ok ? "PASS" : "FAIL", final_wmin, final_wmax, final_wmean);
     pass &= weight_ok;
 
+    // ==================== P2 判据 ====================
+    printf("\n--- P2 中时间尺度学习规则判据 ---\n");
+
+    // 判据 11: CaMKII 活性非零 (机制运行)
+    {
+        const int camkii_sample = 100000;
+        std::vector<float> h_camkii(camkii_sample);
+        cudaMemcpy(h_camkii.data(), allocator.buffers().d_camkii_activity,
+                   camkii_sample * sizeof(float), cudaMemcpyDeviceToHost);
+        double camkii_sum = 0.0;
+        int camkii_nz = 0;
+        for (int i = 0; i < camkii_sample; ++i) {
+            if (h_camkii[i] > 1e-8f) { camkii_nz++; camkii_sum += h_camkii[i]; }
+        }
+        float camkii_mean = camkii_sample > 0 ? static_cast<float>(camkii_sum / camkii_sample) : 0.0f;
+
+        // 同时采样 ca_concentration 用于调试
+        std::vector<BioSynapse> h_syn_sample(1000);
+        cudaMemcpy(h_syn_sample.data(), allocator.buffers().d_synapses,
+                   1000 * sizeof(BioSynapse), cudaMemcpyDeviceToHost);
+        int ca_nz = 0;
+        double ca_sum = 0.0;
+        for (int i = 0; i < 1000; ++i) {
+            if (h_syn_sample[i].ca_concentration > 1e-6f) { ca_nz++; ca_sum += h_syn_sample[i].ca_concentration; }
+        }
+
+        bool camkii_ok = (camkii_nz > 0);
+        printf("  [11] CaMKII 活性 > 0:               %s (nz=%d/%d, mean=%.6f, ca_nz=%d/%d, ca_mean=%.6f)\n",
+               camkii_ok ? "PASS" : "FAIL", camkii_nz, camkii_sample, camkii_mean,
+               ca_nz, 1000, ca_nz > 0 ? ca_sum / 1000 : 0.0);
+        pass &= camkii_ok;
+    }
+
+    // 判据 12: eligibility trace 非零 (e1/e2 活跃)
+    {
+        std::vector<float> h_e1(10000), h_e2(10000);
+        cudaMemcpy(h_e1.data(), allocator.buffers().d_eligibility,
+                   10000 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_e2.data(), allocator.buffers().d_eligibility_slow,
+                   10000 * sizeof(float), cudaMemcpyDeviceToHost);
+        int e1_nz = 0, e2_nz = 0;
+        for (int i = 0; i < 10000; ++i) {
+            if (fabsf(h_e1[i]) > 1e-6f) e1_nz++;
+            if (fabsf(h_e2[i]) > 1e-6f) e2_nz++;
+        }
+        bool elig_ok = (e1_nz > 0 && e2_nz > 0);
+        printf("  [12] eligibility trace 非零:        %s (e1_nz=%d, e2_nz=%d)\n",
+               elig_ok ? "PASS" : "FAIL", e1_nz, e2_nz);
+        pass &= elig_ok;
+    }
+
+    // 判据 13: 调质浓度在 [0, 2] 范围内
+    {
+        stage2e::ModulatoryStats mstats = stage2e::get_modulatory_stats(&allocator);
+        bool mod_range_ok = (mstats.da_mean >= 0.0f && mstats.da_mean <= 2.0f &&
+                             mstats.ach_mean >= 0.0f && mstats.ach_mean <= 2.0f &&
+                             mstats.ne_mean >= 0.0f && mstats.ne_mean <= 2.0f &&
+                             mstats.ht5_mean >= 0.0f && mstats.ht5_mean <= 2.0f);
+        printf("  [13] 调质浓度范围 [0,2]:            %s (DA=%.3f ACh=%.3f NE=%.3f 5HT=%.3f)\n",
+               mod_range_ok ? "PASS" : "FAIL",
+               mstats.da_mean, mstats.ach_mean, mstats.ne_mean, mstats.ht5_mean);
+        pass &= mod_range_ok;
+    }
+
+    // 判据 14: 字节直方图方差 > 0 (字节选择性初步)
+    {
+        int h_hist[256];
+        stage2e::get_byte_histogram(&allocator, h_hist);
+        double hist_mean = 0.0;
+        int hist_nz = 0;
+        for (int i = 0; i < 256; ++i) {
+            hist_mean += h_hist[i];
+            if (h_hist[i] > 0) hist_nz++;
+        }
+        hist_mean /= 256.0;
+        double hist_var = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            double d = h_hist[i] - hist_mean;
+            hist_var += d * d;
+        }
+        hist_var /= 256.0;
+        // 字节选择性: 方差 > 0 表示不同字节产生不同 spike 数
+        bool byte_sel_ok = (hist_var > 1.0 && hist_nz > 10);
+        printf("  [14] 字节直方图方差 > 0:            %s (var=%.1f, nz_bins=%d, mean=%.1f)\n",
+               byte_sel_ok ? "PASS" : "FAIL", hist_var, hist_nz, hist_mean);
+        pass &= byte_sel_ok;
+    }
+
+    // 判据 15: DA 价值函数 V(s) 非平凡 (非零)
+    {
+        stage2e::ModulatoryStats mstats = stage2e::get_modulatory_stats(&allocator);
+        bool value_ok = (fabsf(mstats.v_s) > 1e-6f || fabsf(mstats.v_sp) > 1e-6f);
+        printf("  [15] DA 价值函数 V(s) 非零:         %s (V(s)=%.4f, V(s')=%.4f)\n",
+               value_ok ? "PASS" : "FAIL", mstats.v_s, mstats.v_sp);
+        pass &= value_ok;
+    }
+
     printf("============================================================\n");
-    printf("  P1 总体: %s\n", pass ? "PASS ✓ 准备进入 Phase 2" : "FAIL ✗ 需调参");
+    printf("  %s: %s\n",
+           pass ? "PASS" : "FAIL",
+           pass ? "P1+P2 通过 ✓" : "需调参");
     printf("============================================================\n");
 
     // --- 8. 清理 ---

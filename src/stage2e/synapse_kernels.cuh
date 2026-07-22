@@ -57,6 +57,27 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
 //     utilization = u_new
 void launch_stdp_stp(MemoryAllocator* alloc, int step, int arrived_ring_idx, int arrived_count);
 
+// ==================== P2: 中时间尺度学习规则 ====================
+
+// CaMKII 自磷酸化动力学 (§3, 每10步, Graupner & Brunel 2012)
+// 输入: d_synapses (ca_concentration, camkii_autophosph), d_camkii_activity
+// 输出: d_camkii_activity, d_synapses.camkii_autophosph
+//
+// d(activity)/dt = +k1·Ca^4·(1-activity) - k2·activity·PP1
+// d(autophosph)/dt = +k3·activity^2·(1-autophosph) - k4·autophosph·PP1
+// plasticity_factor = 1.0 - 0.5·autophosph
+void launch_camkii(MemoryAllocator* alloc, int step);
+
+// 2阶 eligibility trace (§3, 每10步)
+// e1(t) = λ1·e1(t-1) + STDP_delta(t)  快 τ~20ms
+// e2(t) = λ2·e2(t-1) + e1(t)          慢 τ~200ms
+void launch_stdp_eligibility(MemoryAllocator* alloc, int step);
+
+// 局部突触缩放 (§3.3, 每100步)
+// scale_local(i) = (target_fr / mean_FR(i))^α
+// w_ij *= scale_i · clamp(scale_j / scale_i, 0.5, 2.0)
+void launch_synaptic_scaling(MemoryAllocator* alloc, int step, float target_fr);
+
 } // namespace stage2e
 
 #endif // SNN_STAGE2E_SYNAPSE_KERNELS_CUH
