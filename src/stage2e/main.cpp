@@ -97,6 +97,10 @@ static void sample_synapse_weight_stats(const stage2e::PersistentBuffers& b,
 }
 
 int main(int argc, char** argv) {
+    // 禁用 stdout 缓冲, 让重定向到文件时也能实时输出 (每 30K 步检查需要)
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     int total_steps = parse_steps(argc, argv);
 
     printf("============================================================\n");
@@ -429,6 +433,73 @@ int main(int argc, char** argv) {
         printf("  [15] DA 价值函数 V(s) 非零:         %s (V(s)=%.4f, V(s')=%.4f)\n",
                value_ok ? "PASS" : "FAIL", mstats.v_s, mstats.v_sp);
         pass &= value_ok;
+    }
+
+    // 判据 16: 卡方显著神经元 > 500 (P2 硬验收, 设计文档 §7.1)
+    // 对每个神经元 i, 用卡方检验判断其对 256 个字节的发放是否有选择性
+    // H0: 神经元对所有字节发放率相同; H1: 对某些字节有选择性
+    // df = 255, p < 0.05 临界值 ≈ 293.2 (查 chi-square 表)
+    {
+        const int N = N_TOTAL_NEURONS_2E;
+        const int B = 256;
+        const int total_neurons = N;
+        const int total_bytes = B;
+
+        // 拷贝 neuron_byte_counts 到 host (55K × 256 × 4B = 56 MB)
+        std::vector<int> h_counts((size_t)total_neurons * total_bytes);
+        cudaMemcpy(h_counts.data(), allocator.buffers().d_neuron_byte_counts,
+                   (size_t)total_neurons * total_bytes * sizeof(int),
+                   cudaMemcpyDeviceToHost);
+
+        // 计算每个字节的注入次数 (应该相等, 但用实际值更安全)
+        // 总注入次数 = total_steps / INPUT_INJECT_INTERVAL
+        int total_injections = total_steps / INPUT_INJECT_INTERVAL;
+        std::vector<int> injections_per_byte(total_bytes, 0);
+        for (int b = 0; b < total_bytes; ++b) {
+            injections_per_byte[b] = total_injections / total_bytes;
+        }
+        // 总注入次数 (用 injections_per_byte 之和)
+        double total_inj_sum = 0.0;
+        for (int b = 0; b < total_bytes; ++b) total_inj_sum += injections_per_byte[b];
+
+        // 卡方检验 (df=255, p<0.05 临界值 ≈ 293.2)
+        // χ²_i = Σ_b (N_ib - E_ib)² / E_ib
+        // E_ib = (Σ_b N_ib) × (injections_b / total_inj_sum)
+        const double chi2_critical = 293.2;  // df=255, p=0.05
+        int significant_neurons = 0;
+        int active_neurons = 0;  // 至少有 1 次 spike 的神经元
+        double chi2_sum = 0.0;
+        double chi2_max = 0.0;
+
+        for (int i = 0; i < total_neurons; ++i) {
+            // 该神经元所有字节的总 spike 数
+            int row_total = 0;
+            for (int b = 0; b < total_bytes; ++b) {
+                row_total += h_counts[(size_t)i * total_bytes + b];
+            }
+            if (row_total < 10) continue;  // 太少不检验
+            active_neurons++;
+
+            // 计算卡方统计量
+            double chi2 = 0.0;
+            for (int b = 0; b < total_bytes; ++b) {
+                double expected = (double)row_total * injections_per_byte[b] / total_inj_sum;
+                if (expected < 1e-10) continue;
+                double diff = (double)h_counts[(size_t)i * total_bytes + b] - expected;
+                chi2 += diff * diff / expected;
+            }
+
+            chi2_sum += chi2;
+            if (chi2 > chi2_max) chi2_max = chi2;
+            if (chi2 > chi2_critical) significant_neurons++;
+        }
+
+        double chi2_mean = active_neurons > 0 ? chi2_sum / active_neurons : 0.0;
+        bool chi2_ok = (significant_neurons > 500);
+        printf("  [16] 卡方显著神经元 > 500:        %s (显著=%d/%d 活跃, 临界=%.1f, 均值=%.1f, 最大=%.1f)\n",
+               chi2_ok ? "PASS" : "FAIL", significant_neurons, active_neurons,
+               chi2_critical, chi2_mean, chi2_max);
+        pass &= chi2_ok;
     }
 
     printf("============================================================\n");

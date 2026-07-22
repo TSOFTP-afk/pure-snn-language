@@ -90,6 +90,9 @@ struct PersistentBuffers {
     // 字节直方图 (NE 用)
     int*               d_byte_histogram;         // 256 × 4B
 
+    // 卡方检验: 每个神经元对每个字节的发放计数 (55K × 256 × 4B = 56 MB)
+    int*               d_neuron_byte_counts;     // N_TOTAL_NEURONS_2E × 256
+
     // 重放注入缓冲 (睡眠态用)
     float*             d_replay_injection;       // 55,000 × 4B
 };

@@ -37,6 +37,21 @@ __global__ void count_spikes_kernel(const bool* spike_flags, int n, int* out_cou
     }
 }
 
+// P2 卡方检验: 累积每个神经元在当前字节下的 spike 计数
+// 仅在 input_inject 步调用 (spike 已由 lif_adex 产生)
+__global__ void accumulate_neuron_byte_counts_kernel(
+    const bool* __restrict__ spike_flags,
+    int* __restrict__ neuron_byte_counts,  // [N_TOTAL_NEURONS_2E × 256]
+    uint8_t current_byte,
+    int n_neurons)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_neurons) return;
+    if (spike_flags[i]) {
+        atomicAdd(&neuron_byte_counts[i * 256 + current_byte], 1);
+    }
+}
+
 BioMechanismScheduler::BioMechanismScheduler(MemoryAllocator* alloc)
     : alloc_(alloc), stats_{}, delay_ring_idx_(0),
       total_steps_(0), total_spikes_accum_(0), inject_spikes_accum_(0),
@@ -87,6 +102,10 @@ void BioMechanismScheduler::step(int current_step) {
     // P2: 字节选择性直方图 (注入步统计 spike count per byte)
     if (is_inject_step) {
         launch_byte_histogram(alloc_, current_byte);
+        // P2 卡方检验: 累积每个神经元在当前字节下的 spike 计数
+        int blocks_neuron = (N_TOTAL_NEURONS_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+        accumulate_neuron_byte_counts_kernel<<<blocks_neuron, THREADS_PER_BLOCK_2E>>>(
+            buf.d_spike_flags, buf.d_neuron_byte_counts, current_byte, N_TOTAL_NEURONS_2E);
     }
 
     // 4. NMDA 受体 + 钙浓度 (pre 侧由延迟到达事件驱动)

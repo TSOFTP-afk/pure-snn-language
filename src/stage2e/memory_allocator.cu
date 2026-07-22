@@ -100,8 +100,12 @@ size_t MemoryAllocator::allocate_all() {
     d_bufs_.d_w_value           = alloc<float>(W_VALUE_DIM, "d_w_value", &total);
     d_bufs_.d_pred_fr           = alloc<float>(W_PRED_DIM, "d_pred_fr", &total);
 
-    // --- 字节直方图 ---
+    // --- 字节直方图 (NE 用) ---
     d_bufs_.d_byte_histogram    = alloc<int>(256, "d_byte_histogram", &total);
+
+    // --- 卡方检验: 神经元×字节发放计数 (55K × 256 = 14.08M int32 = 56 MB) ---
+    d_bufs_.d_neuron_byte_counts = alloc<int>(N_TOTAL_NEURONS_2E * 256,
+                                              "d_neuron_byte_counts (55K×256)", &total);
 
     // --- 重放注入缓冲 ---
     d_bufs_.d_replay_injection  = alloc<float>(N_TOTAL_NEURONS_2E, "d_replay_injection", &total);
@@ -158,6 +162,7 @@ void MemoryAllocator::free_all() {
     FREE_PTR(d_bufs_.d_w_value);
     FREE_PTR(d_bufs_.d_pred_fr);
     FREE_PTR(d_bufs_.d_byte_histogram);
+    FREE_PTR(d_bufs_.d_neuron_byte_counts);
     FREE_PTR(d_bufs_.d_replay_injection);
 
     #undef FREE_PTR
