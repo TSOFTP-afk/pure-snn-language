@@ -57,6 +57,7 @@ set(STAGE2E_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/input_encoding.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/modulatory_kernels.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/thalamic_gate.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
 )
 

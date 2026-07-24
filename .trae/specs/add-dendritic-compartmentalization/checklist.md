@@ -1,0 +1,11 @@
+- [ ] config.h 中新增 `NMDA_CA_TAU_FEEDFORWARD 10.0f` 和 `CA_MAX_FEEDFORWARD 0.12f`
+- [ ] `synapse_nmda_kernel` 根据 `receptor_flags & RECEPTOR_FLAG_FEEDFORWARD` 选择前馈专用 ca_decay 和 ca_max
+- [ ] 前馈连接 Ca²⁺ 上限 0.12 < CA_REBOUND_THRESHOLD 0.15（回弹 LTD 永不触发）
+- [ ] 非前馈连接 Ca²⁺ 动力学不变（仍用 NMDA_CA_TAU=50.0, 上限 1.0）
+- [ ] `build_p1.ps1` 构建成功，无编译错误
+- [ ] step 6000+ 的 l6_spikes > 0（修复前从 step 6000 起为 0）
+- [ ] step 10000 的 L5/L6 chi2_mean 比修复前增长（非停滞在 767/599）
+- [ ] step 50000 的 L5/L6 chi2_mean 持续增长
+- [ ] step 100000 的 L5/L6 chi2_mean 持续增长
+- [ ] L4/L2/3 chi2 增长趋势保持（不应因区室化而受损）
+- [ ] 网络总活动 spikes/step 维持在 [50, 200] 区间（不过度兴奋或静默）

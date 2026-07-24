@@ -73,18 +73,36 @@ __global__ void synapse_nmda_kernel(
     float ampa_decay = expf(-1.0f / AMPA_TAU);     // ~0.819
     float ca_decay   = expf(-1.0f / NMDA_CA_TAU);  // ~0.980
 
+    // 前馈连接树突区室化: 基底树突 Ca²⁺ 快速衰减 (模拟 calbindin 缓冲)
+    // 生物学原理: 基底树突富含 calbindin-D28k 缓冲蛋白, Ca²⁺ 快速清除, 不易触发回弹 LTD
+    // 修复 L5/L6 chi2 停滞: 前馈 Ca²⁺ 上限 0.12 < CA_REBOUND_THRESHOLD 0.15, 回弹 LTD 永不触发
+    // 非前馈连接 (反馈/横向/跨柱) 保持顶端树突动力学, 仍受 Ca²⁺ 回弹 LTD 约束
+    bool is_feedforward = (s.receptor_flags & RECEPTOR_FLAG_FEEDFORWARD);
+    float ca_decay_ff = is_feedforward ? expf(-1.0f / NMDA_CA_TAU_FEEDFORWARD) : ca_decay;
+    float ca_max_ff   = is_feedforward ? CA_MAX_FEEDFORWARD : 1.0f;
+
     s.nmda_conductance *= nmda_decay;
     s.ampa_conductance *= ampa_decay;
-    s.ca_concentration *= ca_decay;
+    s.ca_concentration *= ca_decay_ff;
+
+    // 前馈连接: 每步连续恢复 resource (生物学: STP 恢复是连续过程)
+    // 修复: 原只在 arrival 时恢复导致 resource 稳态≈0.005, 信号被削弱~200倍
+    // 每步恢复让 resource 稳态≈0.13, 有效信号增强~26倍
+    if (s.receptor_flags & RECEPTOR_FLAG_FEEDFORWARD) {
+        float rec_recovery = 1.0f - expf(-1.0f / STP_TAU_REC_FEEDFORWARD);
+        s.resource += (1.0f - s.resource) * rec_recovery;
+    }
 
     // 钙浓度更新 (仅 NMDA 开放时)
     // P2 修正: 0.01→1.0→1000.0
     //   实测 ca_mean=0.000054, Ca⁴≈8.5e-19, 远低于 CaMKII 激活阈值
     //   增大系数到 1000.0, 让 ca_mean≈0.054, Ca⁴≈8.5e-6, act_ss≈1.36e-4 (>1e-8 判据)
     //   生物学解释: ca_concentration 实际表示归一化的 [Ca²⁺]_local, 系数吸收单位换算
+    // 前馈连接: ca_concentration 受 ca_max_ff=0.12 约束, 低于 CA_REBOUND_THRESHOLD=0.15
+    //   → 回弹 LTD 永不触发, 前馈权重不被 Ca²⁺ 超载摧毁, L5/L6 持续发放
     float ca_inflow = s.nmda_conductance * mg_factor * 1000.0f;
     s.ca_concentration += ca_inflow;
-    if (s.ca_concentration > 1.0f) s.ca_concentration = 1.0f;
+    if (s.ca_concentration > ca_max_ff) s.ca_concentration = ca_max_ff;
 
     // 写入钙快照
     ca_snapshot[i] = s.ca_concentration;
@@ -123,12 +141,21 @@ __global__ void synapse_arrival_conductance_kernel(
 }
 
 // =============================================================================
-// stdp_dual_trace_kernel: STDP 双 trace + Δw 计算
+// stdp_dual_trace_kernel: STDP 双 trace + Δw 计算 (PSW 版本)
+// =============================================================================
+// PSW (Probabilistic Synaptic Weights):
+//   - 权重作为 Beta(α,β) 分布的期望: w_eff = W_MAX · α/(α+β)
+//   - LTP 事件 (delta_w > 0): α += η_α · delta_w · M_ij · plasticity_factor
+//   - LTD 事件 (delta_w < 0): β += η_β · |delta_w| · M_ij · plasticity_factor
+//   - α, β > 0 恒成立 → w_eff 物理上 ∈ (0, W_MAX), 不可能饱和
+//   - α+β = 证据强度 → 自适应学习率衰减 (元可塑性自然涌现)
 // =============================================================================
 __global__ void stdp_dual_trace_kernel(
     BioSynapse* __restrict__ synapses,
     const bool* __restrict__ spike_flags,
     float* __restrict__ stdp_x_pre_trace,    // 独立数组 (镜像 BioSynapse.x_pre_trace)
+    float* __restrict__ synapse_alpha,       // PSW: LTP 证据
+    float* __restrict__ synapse_beta,        // PSW: LTD 证据
     const float* __restrict__ da_conc,       // P2: 三因素调制
     const float* __restrict__ ach_conc,
     const float* __restrict__ ne_conc,
@@ -167,7 +194,7 @@ __global__ void stdp_dual_trace_kernel(
         s.last_post_spike = static_cast<float>(step);
     }
 
-    // ----- 4. 应用权重更新 -----
+    // ----- 4. 应用 PSW 权重更新 -----
     // E0 消融: 纯 STDP (M_ij=1, plasticity_factor=1)
     // P2 完整: Δw_final = η · STDP_delta · M_ij(t) · plasticity_factor
     //   M_ij = σ(da_receptor·DA + ach_receptor·ACh + ne_receptor·NE + ht5_receptor·5HT)
@@ -183,24 +210,45 @@ __global__ void stdp_dual_trace_kernel(
                                      + get_ht5_receptor(s) * ht5_conc[post])));
         plasticity_factor = 1.0f - 0.5f * s.camkii_autophosph;
     }
-    float eta = 0.01f;
-    s.weight += eta * delta_w * plasticity_gain * M_ij * plasticity_factor;
+
+    // PSW: delta_w 拆分为 LTP (累加 α) 和 LTD (累加 β)
+    // dual_trace_kernel 中只有 LTP 分量 (delta_w >= 0)
+    // 前馈连接使用专用学习率 (减慢饱和, 防止 L5/L6 chi2 停滞)
+    bool is_feedforward = (s.receptor_flags & RECEPTOR_FLAG_FEEDFORWARD);
+    float eta_alpha = is_feedforward ? PSW_ETA_ALPHA_FEEDFORWARD : PSW_ETA_ALPHA;
+    float eta_beta  = is_feedforward ? PSW_ETA_BETA_FEEDFORWARD  : PSW_ETA_BETA;
+
+    if (delta_w > 0.0f) {
+        float evidence = eta_alpha * delta_w * plasticity_gain * M_ij * plasticity_factor;
+        synapse_alpha[i] += evidence;
+    } else if (delta_w < 0.0f) {
+        float evidence = eta_beta * (-delta_w) * plasticity_gain * M_ij * plasticity_factor;
+        synapse_beta[i] += evidence;
+    }
+
+    // Ca²⁺ 回弹 LTD (生物学防饱和核心机制):
+    // 当突触局部 Ca²⁺ 超过阈值时, 额外累积 β (LTD 证据)
+    // 模拟高频刺激导致的 Ca²⁺ 超载 → 主动削弱突触 (BCM 理论分子基础)
+    // 仅当突触后神经元活跃 (post_spike) 时检查, 避免静息突触误触发
+    if (post_spike && s.ca_concentration > CA_REBOUND_THRESHOLD) {
+        float ca_excess = s.ca_concentration - CA_REBOUND_THRESHOLD;
+        float rebound_evidence = eta_beta * ca_excess * CA_REBOUND_LTD_GAIN
+                                 * plasticity_gain * M_ij;
+        synapse_beta[i] += rebound_evidence;
+    }
+
+    // 防止 α/β 退化 (保持 > 0, 否则 w_eff 无定义)
+    if (synapse_alpha[i] < PSW_ALPHA_MIN) synapse_alpha[i] = PSW_ALPHA_MIN;
+    if (synapse_beta[i]  < PSW_BETA_MIN)  synapse_beta[i]  = PSW_BETA_MIN;
+
+    // 重新计算权重: w_eff = W_MAX · α/(α+β), 抑制性取负
+    bool is_exc = (s.receptor_flags & 0x03);  // AMPA|NMDA
+    float w_mag = STDP_W_MAX_2E * synapse_alpha[i] / (synapse_alpha[i] + synapse_beta[i]);
+    s.weight = is_exc ? w_mag : -w_mag;
 
     // P2: 累积 STDP delta 到 eligibility (供 stdp_eligibility_kernel 吸收)
     // E0 模式也累积, 但 eligibility kernel 不运行 (scheduler 跳过)
     s.eligibility += delta_w;
-
-    // ----- 5. 权重 clamp -----
-    // 兴奋性: weight > 0, clamp 到 [0, W_MAX]
-    // 抑制性: weight < 0, clamp 到 [-W_MAX, 0]
-    bool is_exc = (s.receptor_flags & 0x03);  // AMPA|NMDA
-    if (is_exc) {
-        if (s.weight < 0.0f) s.weight = 0.0f;
-        if (s.weight > STDP_W_MAX_2E) s.weight = STDP_W_MAX_2E;
-    } else {
-        if (s.weight > 0.0f) s.weight = 0.0f;
-        if (s.weight < -STDP_W_MAX_2E) s.weight = -STDP_W_MAX_2E;
-    }
 
     // 同步独立 x_pre_trace 数组 (供其他 kernel 读取)
     stdp_x_pre_trace[i] = s.x_pre_trace;
@@ -210,6 +258,8 @@ __global__ void stdp_arrival_pre_kernel(
     BioSynapse* __restrict__ synapses,
     const int* __restrict__ delay_ring_indices,
     float* __restrict__ stdp_x_pre_trace,
+    float* __restrict__ synapse_alpha,        // PSW: LTP 证据
+    float* __restrict__ synapse_beta,         // PSW: LTD 证据
     const float* __restrict__ da_conc,        // P2: 三因素调制
     const float* __restrict__ ach_conc,
     const float* __restrict__ ne_conc,
@@ -244,20 +294,37 @@ __global__ void stdp_arrival_pre_kernel(
                                      + get_ht5_receptor(s) * ht5_conc[post])));
         plasticity_factor = 1.0f - 0.5f * s.camkii_autophosph;
     }
-    float eta = 0.01f;
-    s.weight += eta * delta_w * plasticity_gain * M_ij * plasticity_factor;
+
+    // PSW: delta_w 拆分为 LTP (累加 α) 和 LTD (累加 β)
+    // arrival_pre_kernel 中只有 LTD 分量 (delta_w <= 0)
+    // 前馈连接使用专用学习率 (减慢饱和, 防止 L5/L6 chi2 停滞)
+    bool is_feedforward = (s.receptor_flags & RECEPTOR_FLAG_FEEDFORWARD);
+    float eta_alpha = is_feedforward ? PSW_ETA_ALPHA_FEEDFORWARD : PSW_ETA_ALPHA;
+    float eta_beta  = is_feedforward ? PSW_ETA_BETA_FEEDFORWARD  : PSW_ETA_BETA;
+
+    if (delta_w > 0.0f) {
+        float evidence = eta_alpha * delta_w * plasticity_gain * M_ij * plasticity_factor;
+        synapse_alpha[syn_idx] += evidence;
+    } else if (delta_w < 0.0f) {
+        float evidence = eta_beta * (-delta_w) * plasticity_gain * M_ij * plasticity_factor;
+        synapse_beta[syn_idx] += evidence;
+    }
+
+    // Ca²⁺ 回弹 LTD 已移除: 该机制仅由 stdp_dual_trace_kernel 在 post_spike 时触发
+    // (BCM 理论: 回弹 LTD 是 post 端 Ca²⁺ 超载的反应, 应由 post 端事件驱动)
+    // pre 到达仅处理标准 STDP 的 LTD 分量 (delta_w = -x_post * A_minus), 不叠加额外 LTD
+
+    if (synapse_alpha[syn_idx] < PSW_ALPHA_MIN) synapse_alpha[syn_idx] = PSW_ALPHA_MIN;
+    if (synapse_beta[syn_idx]  < PSW_BETA_MIN)  synapse_beta[syn_idx]  = PSW_BETA_MIN;
+
+    // 重新计算权重: w_eff = W_MAX · α/(α+β), 抑制性取负
+    bool is_exc = (s.receptor_flags & 0x03);
+    float w_mag = STDP_W_MAX_2E * synapse_alpha[syn_idx] / (synapse_alpha[syn_idx] + synapse_beta[syn_idx]);
+    s.weight = is_exc ? w_mag : -w_mag;
 
     // P2: 累积 STDP delta 到 eligibility
     s.eligibility += delta_w;
 
-    bool is_exc = (s.receptor_flags & 0x03);
-    if (is_exc) {
-        if (s.weight < 0.0f) s.weight = 0.0f;
-        if (s.weight > STDP_W_MAX_2E) s.weight = STDP_W_MAX_2E;
-    } else {
-        if (s.weight > 0.0f) s.weight = 0.0f;
-        if (s.weight < -STDP_W_MAX_2E) s.weight = -STDP_W_MAX_2E;
-    }
     stdp_x_pre_trace[syn_idx] = s.x_pre_trace;
 }
 
@@ -279,14 +346,34 @@ __global__ void stdp_stp_kernel(
 
     BioSynapse& s = synapses[syn_idx];
 
+    // 根据 receptor_flags 选择 STP 参数 (前馈连接用易化型, 其他用抑郁型)
+    // bit4 (RECEPTOR_FLAG_FEEDFORWARD) = 前馈连接标志
+    bool is_feedforward = (s.receptor_flags & RECEPTOR_FLAG_FEEDFORWARD);
+    float baseline_u, tau_fac, tau_rec;
+    if (is_feedforward) {
+        // 前馈连接: 易化型 STP (低 U + 快速恢复, 高频下维持信号)
+        baseline_u = STP_U_FEEDFORWARD;
+        tau_fac = STP_TAU_FAC_FEEDFORWARD;
+        tau_rec = STP_TAU_REC_FEEDFORWARD;
+    } else if (s.receptor_flags & 0x03) {
+        // 兴奋性 (AMPA|NMDA): 抑郁型 STP
+        baseline_u = STP_U_SE;
+        tau_fac = STP_TAU_FAC;
+        tau_rec = STP_TAU_REC;
+    } else {
+        // 抑制性: 抑郁型 STP
+        baseline_u = STP_U_SI;
+        tau_fac = STP_TAU_FAC;
+        tau_rec = STP_TAU_REC;
+    }
+
     // 衰减 (每步)
-    float fac_decay = expf(-1.0f / STP_TAU_FAC);  // ~0.995
-    float rec_recovery = 1.0f - expf(-1.0f / STP_TAU_REC);  // ~0.002
+    float fac_decay = expf(-1.0f / tau_fac);
+    float rec_recovery = 1.0f - expf(-1.0f / tau_rec);
 
     // resource 恢复 (朝 1 衰减恢复)
     s.resource += (1.0f - s.resource) * rec_recovery;
     // utilization 衰减 (朝基线 U 衰减)
-    float baseline_u = (s.receptor_flags & 0x03) ? STP_U_SE : STP_U_SI;
     s.utilization = baseline_u + (s.utilization - baseline_u) * fac_decay;
 
     // 到达事件时: STP 更新
@@ -335,6 +422,8 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
         b.d_synapses,
         b.d_spike_flags,
         b.d_stdp_x_pre_trace,
+        b.d_synapse_alpha,
+        b.d_synapse_beta,
         b.d_da_concentration,
         b.d_ach_concentration,
         b.d_ne_concentration,
@@ -349,6 +438,8 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
             b.d_synapses,
             b.d_delay_ring_indices,
             b.d_stdp_x_pre_trace,
+            b.d_synapse_alpha,
+            b.d_synapse_beta,
             b.d_da_concentration,
             b.d_ach_concentration,
             b.d_ne_concentration,
@@ -523,11 +614,14 @@ __global__ void synaptic_scaling_kernel(
 
 void launch_synaptic_scaling(MemoryAllocator* alloc, int step, float target_fr) {
     (void)step;
-    PersistentBuffers& b = alloc->buffers();
-    int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
-    // alpha = 0.5 (温和缩放)
-    synaptic_scaling_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
-        b.d_synapses, b.d_neurons, N_TOTAL_SYNAPSES_2E, target_fr, 0.5f);
+    (void)target_fr;
+    // PSW 模式下跳过 synaptic_scaling
+    // 原因: PSW 的 α/β 自适应学习率衰减已提供稳态机制
+    //       (α+β 大 → 学习率自动降低, 高活动突触自然稳定)
+    //       synaptic_scaling 直接修改 s.weight 会破坏 α/β 与 weight 的一致性
+    //       (w_eff 必须始终等于 W_MAX · α/(α+β))
+    // 保留 synaptic_scaling_kernel 代码供未来消融对比实验用
+    (void)alloc;
 }
 
 // E0 消融模式: 设置 device 开关

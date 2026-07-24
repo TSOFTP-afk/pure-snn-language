@@ -50,6 +50,10 @@ size_t MemoryAllocator::allocate_all() {
     d_bufs_.d_eligibility       = alloc<float>(N_TOTAL_SYNAPSES_2E, "d_eligibility", &total);
     d_bufs_.d_eligibility_slow  = alloc<float>(N_TOTAL_SYNAPSES_2E, "d_eligibility_slow", &total);
 
+    // --- PSW 概率突触权重 (10.7M × 4B × 2 = 85.6 MB) ---
+    d_bufs_.d_synapse_alpha     = alloc<float>(N_TOTAL_SYNAPSES_2E, "d_synapse_alpha (PSW)", &total);
+    d_bufs_.d_synapse_beta      = alloc<float>(N_TOTAL_SYNAPSES_2E, "d_synapse_beta (PSW)", &total);
+
     // --- v3 强化 A: PCA 反投影矩阵 (55K × 50 × 4B = 11 MB) ---
     d_bufs_.d_pca_W             = alloc<float>((size_t)N_TOTAL_NEURONS_2E * PATTERN_DIM,
                                                "d_pca_W (55K×50)", &total);
@@ -138,6 +142,8 @@ void MemoryAllocator::free_all() {
     FREE_PTR(d_bufs_.d_weights_cache);
     FREE_PTR(d_bufs_.d_eligibility);
     FREE_PTR(d_bufs_.d_eligibility_slow);
+    FREE_PTR(d_bufs_.d_synapse_alpha);
+    FREE_PTR(d_bufs_.d_synapse_beta);
     FREE_PTR(d_bufs_.d_pca_W);
     FREE_PTR(d_bufs_.d_ca_snapshot);
     FREE_PTR(d_bufs_.d_ca_history_sparse);

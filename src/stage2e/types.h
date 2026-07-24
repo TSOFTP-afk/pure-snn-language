@@ -43,7 +43,7 @@ struct NeuronStateAdEx {
 
     // 类型与分区 (8B)
     uint8_t  neuron_type;           // 1B  offset 32  0=兴奋, 1=抑制
-    uint8_t  region;                // 1B  offset 33  0=sensory, 1=assoc, 2=motor, 3=prefrontal
+    uint8_t  region;                // 1B  offset 33  0=L4, 1=L2/3, 2=L5, 3=L6, 4=前额叶 (REGION_* 宏)
     uint8_t  inhibitory_subtype;    // 1B  offset 34  InhibitorySubtype (FS/LTS/SOM)
     uint8_t  column_id;             // 1B  offset 35  所属柱 (0..49) 或 255=前额叶
     int16_t  pf_group_id;           // 2B  offset 36  前额叶组 ID (-1=非前额叶)

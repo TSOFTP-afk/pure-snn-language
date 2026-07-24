@@ -1,19 +1,21 @@
 // =============================================================================
 // Stage 2e 网络初始化实现 (P1)
 // =============================================================================
-// 设计要点:
+// 设计要点 (Phase R2 模块 C: 真实皮层层级结构 L4/L2-3/L5/L6):
 //   1. 神经元布局: 50 柱 × 1000 神经元 = 50K 联合皮层 + 5K 前额叶
-//      - 柱 c 的 sensory 层:    [c*1000,       c*1000 + 200)
-//      - 柱 c 的 association 层: [c*1000 + 200, c*1000 + 800)
-//      - 柱 c 的 motor 层:       [c*1000 + 800, c*1000 + 1000)
-//      - 前额叶:                 [50000, 55000)
-//   2. 80/20 兴奋/抑制: 每层前 80% 兴奋, 后 20% 抑制
-//   3. 抑制亚型: 抑制性中 FS:LTS:SOM = 50:30:20
+//      - 柱 c 的 L4 层:  [c*1000,       c*1000 + 200)    (丘脑输入)
+//      - 柱 c 的 L2/3 层: [c*1000 + 200, c*1000 + 550)   (整合+跨柱)
+//      - 柱 c 的 L5 层:  [c*1000 + 550, c*1000 + 750)   (输出)
+//      - 柱 c 的 L6 层:  [c*1000 + 750, c*1000 + 1000)  (丘脑反馈)
+//      - 前额叶:          [50000, 55000)
+//   2. 80/20 兴奋/抑制: 每层 (L4/L2-3/L5/L6) 内前 80% 兴奋, 后 20% 抑制
+//   3. 抑制亚型: 抑制性中 FS:LTS:SOM = 50:30:20 (每层内独立分配)
 //   4. 突触拓扑 (host 端生成, 一次性上传 GPU):
-//      - 柱内: 每神经元 ~150 个柱内突触 (sensory→assoc→motor 流向 + 同层横向)
-//      - 跨柱: 每神经元 ~30 个跨柱突触 (随机选目标柱)
-//      - 前额叶: 自反馈 + 接收 assoc 投射
-//      - 总数 ~ 55K × 195 ≈ 10.7M
+//      - 柱内: 每神经元 150 个柱内突触 (按生物合理流向规则)
+//          L4 → L2/3,  L2/3 → L2/3(横向)+L5,  L5 → L6+L2/3(反馈),  L6 → L4(反馈)+L6(横向)
+//      - 跨柱: 仅 L2/3 神经元 ~30 个跨柱突触 (pre 和 post 都必须是 L2/3)
+//      - 前额叶投射: 从 L5 发起 ~15 个 (替代旧 association 层)
+//      - 总数 ~ 10.7M (通过补足联合皮层出度维持)
 //   5. 突触延迟: 柱内 1-3, 跨柱 5-10, 长程 15-20
 // =============================================================================
 
@@ -31,6 +33,7 @@ namespace stage2e {
 
 // -----------------------------------------------------------------------------
 // Kernel: 初始化神经元 (cudaMemset 后再填字段)
+// Phase R2 模块 C: 4 层皮层结构 (L4/L2-3/L5/L6) + 前额叶
 // -----------------------------------------------------------------------------
 __global__ void init_neurons_kernel(NeuronStateAdEx* neurons) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -52,38 +55,40 @@ __global__ void init_neurons_kernel(NeuronStateAdEx* neurons) {
 
     // 类型/区域/柱分配
     if (i < N_ASSOCIATION_NEURONS_2E) {
-        // 联合皮层 (50 柱 × 1000)
+        // 联合皮层 (50 柱 × 1000, 4 层皮层结构)
         int col = i / NEURONS_PER_COLUMN_2E;       // 0..49
         int off = i % NEURONS_PER_COLUMN_2E;       // 0..999
         n.column_id = static_cast<uint8_t>(col);
         n.pf_group_id = -1;
 
-        if (off < COL_SENSORY_SIZE_2E) {
-            n.region = 0;  // SENSORY
-        } else if (off < COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E) {
-            n.region = 1;  // ASSOCIATION
+        // 4 层 region 分配 (L4/L2-3/L5/L6)
+        int layer_off, layer_size;
+        if (off < COL_L4_SIZE_2E) {
+            n.region = REGION_L4;             // L4 (丘脑输入层)
+            layer_off = off;
+            layer_size = COL_L4_SIZE_2E;
+        } else if (off < COL_L4_SIZE_2E + COL_L23_SIZE_2E) {
+            n.region = REGION_L23;            // L2/3 (整合+跨柱)
+            layer_off = off - COL_L4_SIZE_2E;
+            layer_size = COL_L23_SIZE_2E;
+        } else if (off < COL_L4_SIZE_2E + COL_L23_SIZE_2E + COL_L5_SIZE_2E) {
+            n.region = REGION_L5;             // L5 (输出层)
+            layer_off = off - COL_L4_SIZE_2E - COL_L23_SIZE_2E;
+            layer_size = COL_L5_SIZE_2E;
         } else {
-            n.region = 2;  // MOTOR
+            n.region = REGION_L6;             // L6 (丘脑反馈层)
+            layer_off = off - COL_L4_SIZE_2E - COL_L23_SIZE_2E - COL_L5_SIZE_2E;
+            layer_size = COL_L6_SIZE_2E;
         }
 
-        // 80/20 兴奋/抑制 (每层内前 80% 兴奋)
-        int layer_off, layer_size;
-        if (off < COL_SENSORY_SIZE_2E) {
-            layer_off = off; layer_size = COL_SENSORY_SIZE_2E;
-        } else if (off < COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E) {
-            layer_off = off - COL_SENSORY_SIZE_2E;
-            layer_size = COL_ASSOCIATION_SIZE_2E;
-        } else {
-            layer_off = off - COL_SENSORY_SIZE_2E - COL_ASSOCIATION_SIZE_2E;
-            layer_size = COL_MOTOR_SIZE_2E;
-        }
+        // 80/20 兴奋/抑制 (每层内独立维持, 前 80% 兴奋)
         int exc_count = static_cast<int>(layer_size * EXCITATORY_RATIO_2E);
         if (layer_off < exc_count) {
             n.neuron_type = 0;  // EXCITATORY
             n.inhibitory_subtype = 0;  // NONE
         } else {
             n.neuron_type = 1;  // INHIBITORY
-            // 抑制亚型分配: 50% FS, 30% LTS, 20% SOM
+            // 抑制亚型分配: 50% FS, 30% LTS, 20% SOM (每层内独立分配)
             int inh_off = layer_off - exc_count;
             int inh_total = layer_size - exc_count;
             float frac = static_cast<float>(inh_off) / static_cast<float>(inh_total);
@@ -100,7 +105,7 @@ __global__ void init_neurons_kernel(NeuronStateAdEx* neurons) {
         int pf_i = i - N_ASSOCIATION_NEURONS_2E;
         int pf_group = pf_i / NEURONS_PER_PF_GROUP;
         n.column_id = 255;       // 255 = 前额叶标记
-        n.region = 3;            // PREFRONTAL
+        n.region = REGION_PREFRONTAL;  // 前额叶 (新枚举值 4)
         n.pf_group_id = static_cast<int16_t>(pf_group);
         // 前额叶 80/20 兴奋/抑制
         int off_in_group = pf_i % NEURONS_PER_PF_GROUP;
@@ -133,21 +138,30 @@ void init_neurons(NeuronStateAdEx* d_neurons) {
 // -----------------------------------------------------------------------------
 // Host: 初始化突触拓扑 (CPU 端生成, 一次性上传)
 // -----------------------------------------------------------------------------
-// 拓扑策略 (设计文档 §2.4 + v3 柱状拓扑):
-//   每神经元目标出度 ~ 195 (10.7M / 55K ≈ 194.5)
-//     - 柱内突触: 150 (sensory→assoc→motor 流向 + 横向)
-//     - 跨柱突触: 30  (随机目标柱, 同流向)
-//     - 前额叶投射: 15 (assoc → 前额叶)
+// 拓扑策略 (Phase R2 模块 C: 真实皮层层级结构):
+//   每神经元目标出度:
+//     - 柱内突触: 150 (按生物合理流向规则, 见下表)
+//     - 跨柱突触: 30  (仅 L2/3 神经元, pre 和 post 都必须是 L2/3)
+//     - 前额叶投射: 15 (仅 L5 神经元, 替代旧 association 层)
+//     - 前额叶自反馈: 100 + 50 到联合皮层
+//   柱内流向规则 (替代旧 sensory→assoc→motor 循环):
+//     L4  → L2/3
+//     L2/3 → L2/3 (横向) + L5
+//     L5  → L6 + L2/3 (反馈)
+//     L6  → L4 (反馈) + L6 (横向)
 //   延迟:
 //     - 柱内: 1-3 步
 //     - 跨柱: 5-10 步
 //     - 长程(前额叶): 15-20 步
+//   总突触数通过补足联合皮层出度维持 ~10.7M (N_TOTAL_SYNAPSES_2E)
 // -----------------------------------------------------------------------------
 void init_synapses_host(std::vector<BioSynapse>& h_synapses,
                        std::vector<int>& h_row_ptr,
                        std::vector<int>& h_col_idx,
                        std::vector<float>& h_weights_cache,
-                       std::vector<uint8_t>& h_delay) {
+                       std::vector<uint8_t>& h_delay,
+                       std::vector<float>& h_alpha,
+                       std::vector<float>& h_beta) {
     // 简单的确定性 PRNG (避免引入 curand 依赖到 host)
     // 使用 xorshift32, 种子 = 42
     uint32_t rng = 42;
@@ -164,38 +178,47 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
         return lo + static_cast<int>(next_rng() % static_cast<uint32_t>(hi - lo));
     };
 
+    // 平衡态网络权重缩放 (van Vreeswijk & Sompolinsky 1996)
+    // w ∝ 1/√K, 调参 2/√K 保留平衡态特性但提升单突触驱动 2 倍
+    const float w_scale = 2.0f / sqrtf((float)SYNAPSES_PER_NEURON_2E);  // ≈ 0.1414
+
     h_row_ptr.assign(N_TOTAL_NEURONS_2E + 1, 0);
     h_synapses.clear();
     h_synapses.reserve(N_TOTAL_SYNAPSES_2E);
     h_col_idx.clear(); h_col_idx.reserve(N_TOTAL_SYNAPSES_2E);
     h_weights_cache.clear(); h_weights_cache.reserve(N_TOTAL_SYNAPSES_2E);
     h_delay.clear(); h_delay.reserve(N_TOTAL_SYNAPSES_2E);
+    h_alpha.clear(); h_alpha.reserve(N_TOTAL_SYNAPSES_2E);
+    h_beta.clear();  h_beta.reserve(N_TOTAL_SYNAPSES_2E);
 
     // 临时统计每神经元出度
     std::vector<int> out_deg(N_TOTAL_NEURONS_2E, 0);
     int total_target = 0;
 
-    // 预计算每神经元的出度
+    // 预计算每神经元出度
+    // - 联合皮层: 150 柱内 + 30 跨柱(仅 L2/3) + 15 前额叶投射(仅 L5)
+    // - 前额叶: 100 自反馈 + 50 到联合皮层
     for (int pre = 0; pre < N_TOTAL_NEURONS_2E; ++pre) {
         int deg = 0;
         if (pre < N_ASSOCIATION_NEURONS_2E) {
-            // 联合皮层: 150 柱内 + 30 跨柱 + 15 前额叶投射 (仅 assoc 层)
-            deg = 150 + 30;
             int off = pre % NEURONS_PER_COLUMN_2E;
-            if (off >= COL_SENSORY_SIZE_2E && off < COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E) {
-                deg += 15;  // 仅 association 层投射到前额叶
+            deg = 150;  // 柱内基线出度
+            if (off >= COL_L4_SIZE_2E && off < COL_L4_SIZE_2E + COL_L23_SIZE_2E) {
+                deg += 30;  // 仅 L2/3 神经元有跨柱突触
+            }
+            if (off >= COL_L4_SIZE_2E + COL_L23_SIZE_2E &&
+                off < COL_L4_SIZE_2E + COL_L23_SIZE_2E + COL_L5_SIZE_2E) {
+                deg += 15;  // 仅 L5 神经元投射到前额叶
             }
         } else {
-            // 前额叶: 100 自反馈 + 50 接收
+            // 前额叶: 100 自反馈 + 50 到联合皮层
             deg = 100 + 50;
         }
         out_deg[pre] = deg;
         total_target += deg;
     }
 
-    // 调整为精确 N_TOTAL_SYNAPSES_2E
-    // 如果 total_target > N_TOTAL_SYNAPSES_2E, 截断
-    // 如果 < , 补足 (给联合皮层加突触)
+    // 调整为精确 N_TOTAL_SYNAPSES_2E (补足联合皮层出度)
     while (total_target < N_TOTAL_SYNAPSES_2E) {
         int pre = randi(0, N_ASSOCIATION_NEURONS_2E);
         out_deg[pre]++;
@@ -209,7 +232,7 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
         }
     }
 
-    // 填充 row_ptr (CSR: row_ptr[0]=0, row_ptr[i+1]-row_ptr[i]=out_deg[i])
+    // 填充 row_ptr (CSR)
     h_row_ptr[0] = 0;
     for (int i = 0; i < N_TOTAL_NEURONS_2E; ++i) {
         h_row_ptr[i + 1] = h_row_ptr[i] + out_deg[i];
@@ -220,6 +243,87 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
     h_col_idx.resize(N_TOTAL_SYNAPSES_2E);
     h_weights_cache.resize(N_TOTAL_SYNAPSES_2E);
     h_delay.resize(N_TOTAL_SYNAPSES_2E);
+    h_alpha.resize(N_TOTAL_SYNAPSES_2E);
+    h_beta.resize(N_TOTAL_SYNAPSES_2E);
+
+    // 辅助 lambda: 柱内指定层的基址 (相对 col_base 的偏移)
+    auto layer_offset_in_col = [](int layer) -> int {
+        switch (layer) {
+            case REGION_L4:  return 0;
+            case REGION_L23: return COL_L4_SIZE_2E;
+            case REGION_L5:  return COL_L4_SIZE_2E + COL_L23_SIZE_2E;
+            case REGION_L6:  return COL_L4_SIZE_2E + COL_L23_SIZE_2E + COL_L5_SIZE_2E;
+            default:         return 0;
+        }
+    };
+    auto layer_sz = [](int layer) -> int {
+        switch (layer) {
+            case REGION_L4:  return COL_L4_SIZE_2E;
+            case REGION_L23: return COL_L23_SIZE_2E;
+            case REGION_L5:  return COL_L5_SIZE_2E;
+            case REGION_L6:  return COL_L6_SIZE_2E;
+            default:         return 0;
+        }
+    };
+    // 辅助 lambda: 按 pre_layer 选择柱内目标层 (生物合理流向规则)
+    //   L4 → L2/3
+    //   L2/3 → L2/3 (横向) 或 L5
+    //   L5 → L6 或 L2/3 (反馈)
+    //   L6 → L4 (反馈) 或 L6 (横向)
+    //   前额叶 → 前额叶 (同组)
+    auto pick_target_layer = [&next_rng](int pre_layer) -> int {
+        if (pre_layer == REGION_L4)  return REGION_L23;
+        if (pre_layer == REGION_L23) return (next_rng() & 1) ? REGION_L23 : REGION_L5;
+        if (pre_layer == REGION_L5)  return (next_rng() & 1) ? REGION_L6 : REGION_L23;
+        if (pre_layer == REGION_L6)  return (next_rng() & 1) ? REGION_L4 : REGION_L6;
+        return REGION_PREFRONTAL;
+    };
+    // 辅助 lambda: 在指定柱和层内随机选一个 post 神经元
+    auto pick_intra_post = [&](int col_base, int target_layer) -> int {
+        int base = col_base + layer_offset_in_col(target_layer);
+        int size = layer_sz(target_layer);
+        return base + randi(0, size);
+    };
+    // 辅助 lambda: 初始化 BioSynapse 通用字段 (避免重复)
+    auto init_syn_fields = [&](int idx, int pre, int post, float weight, uint8_t delay,
+                                bool pre_is_exc, bool is_feedforward = false) {
+        BioSynapse& s = h_synapses[idx];
+        s.pre_idx = pre;
+        s.post_idx = post;
+        s.weight = weight;
+        s.delay_steps = static_cast<float>(delay);
+        s.last_pre_spike = -1000.0f;
+        s.last_post_spike = -1000.0f;
+        s.x_pre_trace = 0.0f;
+        s.x_post_trace = 0.0f;
+        s.nmda_conductance = 0.0f;
+        s.ampa_conductance = 0.0f;
+        s.ca_concentration = 0.0f;
+        s.resource = 1.0f;
+        // 前馈连接使用易化型 STP 基线利用率, 其他用抑郁型
+        s.utilization = is_feedforward ? STP_U_FEEDFORWARD
+                                        : (pre_is_exc ? STP_U_SE : STP_U_SI);
+        s.eligibility = 0.0f;
+        s.eligibility_slow = 0.0f;
+        s.scaling_factor = 1.0f;
+        s.camkii_autophosph = 0.0f;
+        s.da_receptor = pre_is_exc ? DA_RECEPTOR_INIT_EXC : DA_RECEPTOR_INIT_INH;
+        s.ach_receptor = ACH_RECEPTOR_INIT;
+        // receptor_flags: bit0=AMPA, bit1=NMDA, bit2=GABA_A, bit3=GABA_B, bit4=前馈标志
+        uint8_t flags = pre_is_exc ? 0x03 : 0x0C;  // AMPA+NMDA or GABA_A+GABA_B
+        if (is_feedforward) flags |= RECEPTOR_FLAG_FEEDFORWARD;  // bit4 标记前馈连接
+        s.receptor_flags = flags;
+        set_ne_receptor(s, NE_RECEPTOR_INIT);
+        set_ht5_receptor(s, HT5_RECEPTOR_INIT);
+        s._pad = 0;
+        // PSW 初始化: α/(α+β) = |w|/W_MAX, 总证据 α+β=0.1 (弱先验)
+        float w_ratio = fabsf(weight) / STDP_W_MAX_2E;
+        if (w_ratio > 0.999f) w_ratio = 0.999f;
+        h_alpha[idx] = w_ratio * PSW_EVIDENCE_INIT_TOTAL;
+        h_beta[idx]  = (1.0f - w_ratio) * PSW_EVIDENCE_INIT_TOTAL;
+        h_weights_cache[idx] = weight;
+        h_delay[idx] = delay;
+    };
 
     for (int pre = 0; pre < N_TOTAL_NEURONS_2E; ++pre) {
         int start = h_row_ptr[pre];
@@ -229,184 +333,92 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
         bool is_pf = (pre >= N_ASSOCIATION_NEURONS_2E);
         int pre_col = is_pf ? -1 : (pre / NEURONS_PER_COLUMN_2E);
         int pre_off = is_pf ? 0 : (pre % NEURONS_PER_COLUMN_2E);
-        // 判断 pre 的层
-        int pre_layer;  // 0=sensory, 1=assoc, 2=motor, 3=prefrontal
+        // 判断 pre 的层 (0=L4, 1=L2/3, 2=L5, 3=L6, 4=prefrontal)
+        int pre_layer;
         if (is_pf) {
-            pre_layer = 3;
-        } else if (pre_off < COL_SENSORY_SIZE_2E) {
-            pre_layer = 0;
-        } else if (pre_off < COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E) {
-            pre_layer = 1;
+            pre_layer = REGION_PREFRONTAL;
+        } else if (pre_off < COL_L4_SIZE_2E) {
+            pre_layer = REGION_L4;
+        } else if (pre_off < COL_L4_SIZE_2E + COL_L23_SIZE_2E) {
+            pre_layer = REGION_L23;
+        } else if (pre_off < COL_L4_SIZE_2E + COL_L23_SIZE_2E + COL_L5_SIZE_2E) {
+            pre_layer = REGION_L5;
         } else {
-            pre_layer = 2;
+            pre_layer = REGION_L6;
         }
 
-        // 兴奋/抑制类型 (前 80% 兴奋)
+        // 兴奋/抑制类型 (前 80% 兴奋, 每层内独立)
         bool pre_is_exc;
-        int layer_size, layer_off;
-        if (pre_layer == 3) {
-            layer_size = NEURONS_PER_PF_GROUP;
-            layer_off = (pre - N_ASSOCIATION_NEURONS_2E) % NEURONS_PER_PF_GROUP;
-        } else if (pre_layer == 0) {
-            layer_size = COL_SENSORY_SIZE_2E;
-            layer_off = pre_off;
-        } else if (pre_layer == 1) {
-            layer_size = COL_ASSOCIATION_SIZE_2E;
-            layer_off = pre_off - COL_SENSORY_SIZE_2E;
+        int l_size, l_off;
+        if (pre_layer == REGION_PREFRONTAL) {
+            l_size = NEURONS_PER_PF_GROUP;
+            l_off = (pre - N_ASSOCIATION_NEURONS_2E) % NEURONS_PER_PF_GROUP;
         } else {
-            layer_size = COL_MOTOR_SIZE_2E;
-            layer_off = pre_off - COL_SENSORY_SIZE_2E - COL_ASSOCIATION_SIZE_2E;
+            l_size = layer_sz(pre_layer);
+            l_off = pre_off - layer_offset_in_col(pre_layer);
         }
-        int exc_count = static_cast<int>(layer_size * EXCITATORY_RATIO_2E);
-        pre_is_exc = (layer_off < exc_count);
+        int exc_count = static_cast<int>(l_size * EXCITATORY_RATIO_2E);
+        pre_is_exc = (l_off < exc_count);
 
-        // 按出度类型分配目标
-        // 联合皮层: 150 柱内 + 30 跨柱 + 15 前额叶 (仅 assoc)
-        // 前额叶: 100 自反馈 + 50 到联合皮层
+        // 按出度类型分配
         int n_intra = is_pf ? 100 : 150;
-        int n_inter = is_pf ? 0  : 30;
-        int n_pf    = is_pf ? 50 : (pre_layer == 1 ? 15 : 0);
+        int n_inter = (pre_layer == REGION_L23) ? 30 : 0;       // 仅 L2/3 有跨柱突触
+        int n_pf    = is_pf ? 50 : (pre_layer == REGION_L5 ? 15 : 0);  // 仅 L5 投射前额叶
 
-        // 柱内目标 (n_intra 个)
+        // ---- 柱内目标 (n_intra 个, 按流向规则) ----
         for (int k = 0; k < n_intra && n_written < deg; ++k) {
             int post;
-            int target_layer;
-            // 流向: sensory→assoc, assoc→motor, motor→assoc (循环), 前额叶→前额叶
-            if (pre_layer == 0) {
-                target_layer = 1;  // sensory → assoc
-            } else if (pre_layer == 1) {
-                target_layer = 2;  // assoc → motor
-            } else if (pre_layer == 2) {
-                target_layer = 1;  // motor → assoc
-            } else {
-                target_layer = 3;  // pf → pf
-            }
-
+            bool is_feedforward = false;
             if (is_pf) {
+                // 前额叶 → 同组前额叶 (自反馈)
                 int group_base = N_ASSOCIATION_NEURONS_2E +
                     ((pre - N_ASSOCIATION_NEURONS_2E) / NEURONS_PER_PF_GROUP) * NEURONS_PER_PF_GROUP;
                 post = group_base + randi(0, NEURONS_PER_PF_GROUP);
             } else {
                 int col_base = pre_col * NEURONS_PER_COLUMN_2E;
-                if (target_layer == 0) {
-                    post = col_base + randi(0, COL_SENSORY_SIZE_2E);
-                } else if (target_layer == 1) {
-                    post = col_base + COL_SENSORY_SIZE_2E + randi(0, COL_ASSOCIATION_SIZE_2E);
-                } else {
-                    post = col_base + COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E + randi(0, COL_MOTOR_SIZE_2E);
-                }
+                int target_layer = pick_target_layer(pre_layer);
+                post = pick_intra_post(col_base, target_layer);
+                // 前馈连接判断 (L4→L2/3, L2/3→L5, L5→L6): 使用增强权重打破"鸡生蛋"困境
+                is_feedforward = (pre_layer == REGION_L4  && target_layer == REGION_L23) ||
+                                 (pre_layer == REGION_L23 && target_layer == REGION_L5)  ||
+                                 (pre_layer == REGION_L5  && target_layer == REGION_L6);
             }
-
             // 避免自环
             if (post == pre) post = (post + 1) % N_TOTAL_NEURONS_2E;
 
             int idx = start + n_written;
             h_col_idx[idx] = post;
-
-            // 初始化 BioSynapse 字段
-            BioSynapse& s = h_synapses[idx];
-            s.pre_idx = pre;
-            s.post_idx = post;
-            // 权重: 兴奋性 [0.4, 1.0], 抑制性 [-1.0, -0.4]
-            if (pre_is_exc) {
-                s.weight = randf(0.4f, 1.0f);
-            } else {
-                s.weight = randf(-1.0f, -0.4f);
-            }
-            // 延迟: 柱内 1-3, 前额叶自反馈 1-3
+            // 权重: 前馈连接 [2.5,3.5], 其他 [0.4,1.0] (1/√K 缩放)
+            float w_exc_min = is_feedforward ? FEEDFORWARD_W_EXC_MIN : 0.4f;
+            float w_exc_max = is_feedforward ? FEEDFORWARD_W_EXC_MAX : 1.0f;
+            float w = pre_is_exc ? randf(w_exc_min, w_exc_max) * w_scale
+                                  : randf(-w_exc_max, -w_exc_min) * w_scale;
             uint8_t delay = static_cast<uint8_t>(randi(DELAY_INTRA_MIN, DELAY_INTRA_MAX + 1));
-            s.delay_steps = static_cast<float>(delay);
-            h_delay[idx] = delay;
-
-            // STDP 双 trace
-            s.last_pre_spike = -1000.0f;
-            s.last_post_spike = -1000.0f;
-            s.x_pre_trace = 0.0f;
-            s.x_post_trace = 0.0f;
-
-            // 电导 + 钙
-            s.nmda_conductance = 0.0f;
-            s.ampa_conductance = 0.0f;
-            s.ca_concentration = 0.0f;
-            // STP 资源 R=1 (满), 利用率 U = 兴奋 0.2 / 抑制 0.05
-            s.resource = 1.0f;
-            s.utilization = pre_is_exc ? STP_U_SE : STP_U_SI;
-
-            // Eligibility
-            s.eligibility = 0.0f;
-            s.eligibility_slow = 0.0f;
-            s.scaling_factor = 1.0f;
-
-            // CaMKII + 受体
-            s.camkii_autophosph = 0.0f;
-            s.da_receptor = pre_is_exc ? DA_RECEPTOR_INIT_EXC : DA_RECEPTOR_INIT_INH;
-            s.ach_receptor = ACH_RECEPTOR_INIT;
-            s.receptor_flags = pre_is_exc ? 0x03 : 0x0C;  // AMPA+NMDA or GABA_A+GABA_B
-            set_ne_receptor(s, NE_RECEPTOR_INIT);
-            set_ht5_receptor(s, HT5_RECEPTOR_INIT);
-            s._pad = 0;
-
-            h_weights_cache[idx] = s.weight;
+            init_syn_fields(idx, pre, post, w, delay, pre_is_exc, is_feedforward);
             n_written++;
         }
 
-        // 跨柱目标 (n_inter 个, 仅联合皮层)
+        // ---- 跨柱目标 (n_inter 个, 仅 L2/3 → L2/3) ----
         for (int k = 0; k < n_inter && n_written < deg; ++k) {
             int target_col = randi(0, N_COLUMNS_2E);
             if (target_col == pre_col) target_col = (target_col + 1) % N_COLUMNS_2E;
 
+            // 跨柱约束: post 必须是目标柱的 L2/3 层 (pre 已经是 L2/3)
             int col_base = target_col * NEURONS_PER_COLUMN_2E;
-            // 跨柱投射: 同层为主 (sensory→sensory, assoc→assoc)
-            int post;
-            if (pre_layer == 0) {
-                post = col_base + randi(0, COL_SENSORY_SIZE_2E);
-            } else if (pre_layer == 1) {
-                post = col_base + COL_SENSORY_SIZE_2E + randi(0, COL_ASSOCIATION_SIZE_2E);
-            } else {
-                post = col_base + COL_SENSORY_SIZE_2E + COL_ASSOCIATION_SIZE_2E + randi(0, COL_MOTOR_SIZE_2E);
-            }
+            int post = col_base + layer_offset_in_col(REGION_L23) +
+                       randi(0, layer_sz(REGION_L23));
 
             int idx = start + n_written;
             h_col_idx[idx] = post;
-
-            BioSynapse& s = h_synapses[idx];
-            s.pre_idx = pre;
-            s.post_idx = post;
-            // 跨柱较弱 (相对柱内, 但保持可驱动性)
-            if (pre_is_exc) {
-                s.weight = randf(0.5f, 1.0f);
-            } else {
-                s.weight = randf(-1.0f, -0.5f);
-            }
+            // 跨柱大幅弱化 (R1 消融实验: [0.05,0.15]/[-0.15,-0.05], 抑制跨柱兴奋传播)
+            float w = pre_is_exc ? randf(CROSS_COL_W_EXC_MIN, CROSS_COL_W_EXC_MAX) * w_scale
+                                  : randf(CROSS_COL_W_INH_MIN, CROSS_COL_W_INH_MAX) * w_scale;
             uint8_t delay = static_cast<uint8_t>(randi(DELAY_INTER_MIN, DELAY_INTER_MAX + 1));
-            s.delay_steps = static_cast<float>(delay);
-            h_delay[idx] = delay;
-
-            s.last_pre_spike = -1000.0f;
-            s.last_post_spike = -1000.0f;
-            s.x_pre_trace = 0.0f;
-            s.x_post_trace = 0.0f;
-            s.nmda_conductance = 0.0f;
-            s.ampa_conductance = 0.0f;
-            s.ca_concentration = 0.0f;
-            s.resource = 1.0f;
-            s.utilization = pre_is_exc ? STP_U_SE : STP_U_SI;
-            s.eligibility = 0.0f;
-            s.eligibility_slow = 0.0f;
-            s.scaling_factor = 1.0f;
-            s.camkii_autophosph = 0.0f;
-            s.da_receptor = pre_is_exc ? DA_RECEPTOR_INIT_EXC : DA_RECEPTOR_INIT_INH;
-            s.ach_receptor = ACH_RECEPTOR_INIT;
-            s.receptor_flags = pre_is_exc ? 0x03 : 0x0C;
-            set_ne_receptor(s, NE_RECEPTOR_INIT);
-            set_ht5_receptor(s, HT5_RECEPTOR_INIT);
-            s._pad = 0;
-
-            h_weights_cache[idx] = s.weight;
+            init_syn_fields(idx, pre, post, w, delay, pre_is_exc);
             n_written++;
         }
 
-        // 前额叶投射 (n_pf 个)
+        // ---- 前额叶投射 (n_pf 个) ----
         for (int k = 0; k < n_pf && n_written < deg; ++k) {
             int post;
             uint8_t delay;
@@ -415,7 +427,7 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
                 post = randi(0, N_ASSOCIATION_NEURONS_2E);
                 delay = static_cast<uint8_t>(randi(DELAY_LONG_MIN, DELAY_LONG_MAX + 1));
             } else {
-                // association → 前额叶 (长程投射)
+                // L5 → 前额叶 (长程投射, 替代旧 association → 前额叶)
                 int pf_group = randi(0, PREFRONTAL_GROUPS);
                 post = N_ASSOCIATION_NEURONS_2E + pf_group * NEURONS_PER_PF_GROUP +
                        randi(0, NEURONS_PER_PF_GROUP);
@@ -424,90 +436,37 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
 
             int idx = start + n_written;
             h_col_idx[idx] = post;
-
-            BioSynapse& s = h_synapses[idx];
-            s.pre_idx = pre;
-            s.post_idx = post;
             // 长程投射 (前额叶) - 维持与柱内同量级以保持信号传播
-            if (pre_is_exc) {
-                s.weight = randf(0.6f, 1.2f);
-            } else {
-                s.weight = randf(-1.2f, -0.6f);
-            }
-            s.delay_steps = static_cast<float>(delay);
-            h_delay[idx] = delay;
-
-            s.last_pre_spike = -1000.0f;
-            s.last_post_spike = -1000.0f;
-            s.x_pre_trace = 0.0f;
-            s.x_post_trace = 0.0f;
-            s.nmda_conductance = 0.0f;
-            s.ampa_conductance = 0.0f;
-            s.ca_concentration = 0.0f;
-            s.resource = 1.0f;
-            s.utilization = pre_is_exc ? STP_U_SE : STP_U_SI;
-            s.eligibility = 0.0f;
-            s.eligibility_slow = 0.0f;
-            s.scaling_factor = 1.0f;
-            s.camkii_autophosph = 0.0f;
-            s.da_receptor = pre_is_exc ? DA_RECEPTOR_INIT_EXC : DA_RECEPTOR_INIT_INH;
-            s.ach_receptor = ACH_RECEPTOR_INIT;
-            s.receptor_flags = pre_is_exc ? 0x03 : 0x0C;
-            set_ne_receptor(s, NE_RECEPTOR_INIT);
-            set_ht5_receptor(s, HT5_RECEPTOR_INIT);
-            s._pad = 0;
-
-            h_weights_cache[idx] = s.weight;
+            float w = pre_is_exc ? randf(0.6f, 1.2f) * w_scale
+                                  : randf(-1.2f, -0.6f) * w_scale;
+            init_syn_fields(idx, pre, post, w, delay, pre_is_exc);
             n_written++;
         }
 
-        // 剩余的突触 (如果 n_written < deg): 用柱内随机填充
+        // ---- 剩余突触 (补足出度, 用柱内流向规则填充) ----
         while (n_written < deg) {
             int post;
+            bool is_feedforward = false;
             if (is_pf) {
                 post = N_ASSOCIATION_NEURONS_2E + randi(0, N_PREFRONTAL_NEURONS);
             } else {
-                post = randi(0, N_ASSOCIATION_NEURONS_2E);
+                int col_base = pre_col * NEURONS_PER_COLUMN_2E;
+                int target_layer = pick_target_layer(pre_layer);
+                post = pick_intra_post(col_base, target_layer);
+                is_feedforward = (pre_layer == REGION_L4  && target_layer == REGION_L23) ||
+                                 (pre_layer == REGION_L23 && target_layer == REGION_L5)  ||
+                                 (pre_layer == REGION_L5  && target_layer == REGION_L6);
             }
             if (post == pre) post = (post + 1) % N_TOTAL_NEURONS_2E;
 
             int idx = start + n_written;
             h_col_idx[idx] = post;
-
-            BioSynapse& s = h_synapses[idx];
-            s.pre_idx = pre;
-            s.post_idx = post;
-            // 前额叶自反馈 - 与柱内同量级
-            if (pre_is_exc) {
-                s.weight = randf(0.6f, 1.2f);
-            } else {
-                s.weight = randf(-1.2f, -0.6f);
-            }
+            float w_exc_min = is_feedforward ? FEEDFORWARD_W_EXC_MIN : 0.4f;
+            float w_exc_max = is_feedforward ? FEEDFORWARD_W_EXC_MAX : 1.0f;
+            float w = pre_is_exc ? randf(w_exc_min, w_exc_max) * w_scale
+                                  : randf(-w_exc_max, -w_exc_min) * w_scale;
             uint8_t delay = static_cast<uint8_t>(randi(DELAY_INTRA_MIN, DELAY_INTRA_MAX + 1));
-            s.delay_steps = static_cast<float>(delay);
-            h_delay[idx] = delay;
-
-            s.last_pre_spike = -1000.0f;
-            s.last_post_spike = -1000.0f;
-            s.x_pre_trace = 0.0f;
-            s.x_post_trace = 0.0f;
-            s.nmda_conductance = 0.0f;
-            s.ampa_conductance = 0.0f;
-            s.ca_concentration = 0.0f;
-            s.resource = 1.0f;
-            s.utilization = pre_is_exc ? STP_U_SE : STP_U_SI;
-            s.eligibility = 0.0f;
-            s.eligibility_slow = 0.0f;
-            s.scaling_factor = 1.0f;
-            s.camkii_autophosph = 0.0f;
-            s.da_receptor = pre_is_exc ? DA_RECEPTOR_INIT_EXC : DA_RECEPTOR_INIT_INH;
-            s.ach_receptor = ACH_RECEPTOR_INIT;
-            s.receptor_flags = pre_is_exc ? 0x03 : 0x0C;
-            set_ne_receptor(s, NE_RECEPTOR_INIT);
-            set_ht5_receptor(s, HT5_RECEPTOR_INIT);
-            s._pad = 0;
-
-            h_weights_cache[idx] = s.weight;
+            init_syn_fields(idx, pre, post, w, delay, pre_is_exc, is_feedforward);
             n_written++;
         }
     }
@@ -521,6 +480,8 @@ int init_synapses(BioSynapse* d_synapses,
                   int* d_csr_col_idx,
                   float* d_weights_cache,
                   uint8_t* d_synapse_delay,
+                  float* d_synapse_alpha,
+                  float* d_synapse_beta,
                   const NeuronStateAdEx* d_neurons) {
     (void)d_neurons;  // P1 不依赖 d_neurons 内容做初始化
 
@@ -530,9 +491,11 @@ int init_synapses(BioSynapse* d_synapses,
     std::vector<int> h_col;
     std::vector<float> h_w;
     std::vector<uint8_t> h_d;
+    std::vector<float> h_alpha;
+    std::vector<float> h_beta;
 
     printf("[Stage2e P1] 生成突触拓扑 (host 端, ~10.7M 突触)...\n");
-    init_synapses_host(h_syn, h_row, h_col, h_w, h_d);
+    init_synapses_host(h_syn, h_row, h_col, h_w, h_d, h_alpha, h_beta);
 
     int n_syn = static_cast<int>(h_syn.size());
     printf("[Stage2e P1] 实际生成: %d 突触, %d row_ptr 项\n", n_syn, static_cast<int>(h_row.size()));
@@ -552,6 +515,13 @@ int init_synapses(BioSynapse* d_synapses,
                               cudaMemcpyHostToDevice));
     CUDA_CHECK_2E(cudaMemcpy(d_synapse_delay, h_d.data(),
                               n_syn * sizeof(uint8_t),
+                              cudaMemcpyHostToDevice));
+    // PSW: 上传 alpha/beta 数组
+    CUDA_CHECK_2E(cudaMemcpy(d_synapse_alpha, h_alpha.data(),
+                              n_syn * sizeof(float),
+                              cudaMemcpyHostToDevice));
+    CUDA_CHECK_2E(cudaMemcpy(d_synapse_beta, h_beta.data(),
+                              n_syn * sizeof(float),
                               cudaMemcpyHostToDevice));
     printf("[Stage2e P1] 突触拓扑已上传 GPU\n");
     return n_syn;
@@ -608,9 +578,10 @@ void init_network(MemoryAllocator* alloc) {
     printf("[Stage2e P1] 初始化神经元 (55K AdEx 静息)...\n");
     init_neurons(b.d_neurons);
 
-    printf("[Stage2e P1] 初始化突触拓扑 + 延迟 + STP + 调质受体...\n");
+    printf("[Stage2e P1] 初始化突触拓扑 + 延迟 + STP + 调质受体 + PSW...\n");
     int n_syn = init_synapses(b.d_synapses, b.d_csr_row_ptr, b.d_csr_col_idx,
                               b.d_weights_cache, b.d_synapse_delay,
+                              b.d_synapse_alpha, b.d_synapse_beta,
                               b.d_neurons);
     if (n_syn != N_TOTAL_SYNAPSES_2E) {
         fprintf(stderr, "[Stage2e P1 WARN] 突触数 %d != 目标 %d\n", n_syn, N_TOTAL_SYNAPSES_2E);

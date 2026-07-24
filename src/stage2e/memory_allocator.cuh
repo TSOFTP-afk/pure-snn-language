@@ -38,6 +38,11 @@ struct PersistentBuffers {
     float*             d_eligibility;            // 10,700,000 × 4B (1 阶, 独立数组便于原子操作)
     float*             d_eligibility_slow;       // 10,700,000 × 4B (v3 强化 H: 2 阶)
 
+    // PSW 概率突触权重 (10.7M × 4B × 2 = 85.6 MB)
+    // w_eff = W_MAX · α/(α+β), 取代硬 clamp, 物理上消除饱和
+    float*             d_synapse_alpha;          // 10,700,000 × 4B  LTP 证据累积
+    float*             d_synapse_beta;           // 10,700,000 × 4B  LTD 证据累积
+
     // PCA 反投影 (v3 强化 A: 55K × 50 × 4B = 11 MB)
     float*             d_pca_W;                  // 55,000 × 50
 
