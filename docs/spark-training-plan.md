@@ -50,6 +50,7 @@ src/stage2e/build/snn_stage2e_p1 \
 ```
 
 门禁：退出码 0、无 CUDA error/NaN/OOM、delay drop rate 在既有基线范围、核心指标能输出。
+默认退出码表示运行完整性，不要求 PSW 等长时间尺度科学指标在 10K 内成熟；需要把全部科学判据作为硬门禁时显式增加 `--strict-criteria`。
 
 ### G3：checkpoint 等价性
 

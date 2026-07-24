@@ -66,6 +66,8 @@ bool parse_run_config(int argc, char** argv, RunConfig* config, std::string* err
             config->e0_mode = true;
         } else if (arg == "--synthetic-input") {
             config->synthetic_input = true;
+        } else if (arg == "--strict-criteria") {
+            config->strict_criteria = true;
         } else if (arg == "--steps") {
             value = require_value(&i, "--steps");
             if (!value || !parse_long(value, 1, INT_MAX, "--steps", &parsed, error)) return false;
@@ -127,6 +129,7 @@ const char* run_config_usage() {
         "  --keep-checkpoints N      retain newest N; 0 retains all\n"
         "  --resume PATH             resume a complete Stage 2e checkpoint\n"
         "  --synthetic-input         explicit 0..255 cyclic smoke-test input\n"
+        "  --strict-criteria         return nonzero when scientific criteria are unmet\n"
         "  --e0                      pure-STDP ablation\n"
         "  -h, --help                show this help\n";
 }

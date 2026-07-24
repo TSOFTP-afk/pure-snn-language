@@ -488,6 +488,7 @@ ninja snn_stage2e_p1
 - `--keep-checkpoints N`：保留最新 N 个，`0` 表示不清理；默认 3。
 - `--resume PATH`：恢复 `.snn2e` 完整状态。
 - `--synthetic-input`：显式启用 `0..255` 循环输入，仅用于烟雾测试；真实语料加载失败时不再静默回退。
+- `--strict-criteria`：科学判据未全部通过时返回非零；默认退出码只表示运行、CUDA 与 checkpoint 是否成功，所有科学判据仍会输出到 `FINAL_METRIC`。
 
 Stage 2e v3 checkpoint 包含全部持久 GPU 缓冲、调度器状态和文本游标，写入时使用临时文件、CRC32 payload 校验、完成 footer 和同目录原子改名。收到 `SIGINT`/`SIGTERM` 时会先保存再退出。
 

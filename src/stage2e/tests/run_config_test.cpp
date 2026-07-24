@@ -18,7 +18,7 @@ int main() {
         std::string error;
         assert(parse({"test", "--steps", "3000000", "--seed", "7", "--device", "1",
                       "--text", "corpus.txt", "--resume", "checkpoint.bin", "--e0",
-                      "--synthetic-input"},
+                      "--synthetic-input", "--strict-criteria"},
                      &cfg, &error));
         assert(cfg.total_steps == 3000000);
         assert(cfg.seed == 7);
@@ -27,6 +27,7 @@ int main() {
         assert(cfg.resume_path == "checkpoint.bin");
         assert(cfg.e0_mode);
         assert(cfg.synthetic_input);
+        assert(cfg.strict_criteria);
     }
     {
         stage2e::RunConfig cfg;

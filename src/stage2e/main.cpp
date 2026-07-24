@@ -68,6 +68,7 @@ static void print_experiment_metadata(FILE* fp, const char* prefix,
     emit_run_param(fp, prefix, "total_steps", "%d", config.total_steps);
     emit_run_param(fp, prefix, "e0_mode", "%d", config.e0_mode ? 1 : 0);
     emit_run_param(fp, prefix, "synthetic_input", "%d", config.synthetic_input ? 1 : 0);
+    emit_run_param(fp, prefix, "strict_criteria", "%d", config.strict_criteria ? 1 : 0);
     emit_run_param(fp, prefix, "device", "%d", config.device);
     emit_run_param(fp, prefix, "seed", "%u", config.seed);
     emit_run_param(fp, prefix, "text_path", "%s", config.text_path.c_str());
@@ -1458,6 +1459,10 @@ int main(int argc, char** argv) {
     printf("  %s: %s\n",
            pass ? "PASS" : "FAIL",
            pass ? "语义涌现路径可继续 ✓" : "语义涌现路径需继续调参");
+    printf("  RUN_STATUS: COMPLETE%s\n",
+           (!pass && !config.strict_criteria)
+               ? " (科学判据未全部成熟；未启用 --strict-criteria)"
+               : "");
     printf("============================================================\n");
 
     printf("\nFINAL_METRICS_BEGIN\n");
@@ -1568,5 +1573,5 @@ int main(int argc, char** argv) {
     allocator.free_all();
     cudaDeviceReset();
 
-    return pass ? 0 : 1;
+    return (config.strict_criteria && !pass) ? 2 : 0;
 }

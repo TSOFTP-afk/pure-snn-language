@@ -33,6 +33,7 @@ class SourceContracts(unittest.TestCase):
         for option in (
             "--steps", "--device", "--seed", "--text", "--checkpoint-dir",
             "--checkpoint-interval", "--keep-checkpoints", "--resume",
+            "--strict-criteria",
         ):
             self.assertIn(option, config)
 

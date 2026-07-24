@@ -14,6 +14,7 @@ struct RunConfig {
     int keep_checkpoints = 3;
     bool e0_mode = false;
     bool synthetic_input = false;
+    bool strict_criteria = false;
     bool show_help = false;
     std::string text_path = "data/lccc_sample_1mb.txt";
     std::string csv_path;
