@@ -79,7 +79,9 @@ target_compile_options(snn_stage2e_p1 PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>
 )
 
-# RTX 3060 = compute capability 8.6 (Ampere)
+# CUDA 架构: 同时支持 Ampere (RTX 3060, sm_86) 和 Blackwell (DGX Spark GB10, sm_120)
+# CMake 3.18+ 的 CUDA_ARCHITECTURES "a;b" 语法会为两个架构生成代码
+# 本地运行用 sm_86, DGX Spark 运行用 sm_120
 set_target_properties(snn_stage2e_p1 PROPERTIES
-    CUDA_ARCHITECTURES "86"
+    CUDA_ARCHITECTURES "86;120"
 )
