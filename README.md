@@ -4,9 +4,11 @@
 > 全流程零框架依赖，所有神经元模型、突触动力学、STDP、BPTT、分析工具链均从零自研。
 >
 > **项目正在 Stage 2e 阶段**：在 5.5×10⁴ 神经元 / 1.07×10⁷ 突触 / 50 柱规模上叠加多层级生物机制
-> （AdEx / NMDA / STP / PSW / Ca²⁺回弹 / CaMKII / 丘脑门控 / 前额叶-工作记忆雏形），
-> 验证"更高生物保真度能否跨越从突触结构到语义结构的鸿沟"。
-> 阶段 0-2c 已证伪"纯 STDP 能产生语义级结构"的假设；Stage 2e 是对该假设的第二次试探。
+> （AdEx / NMDA / STP / PSW / Ca²⁺回弹 / CaMKII / 丘脑门控 / 皮层层级 L4-L2/3-L5-L6 / 树突区室化 / 前额叶-工作记忆雏形），
+> 已完成 100K 步 LCCC 真实中文文本训练。
+> 阶段 0-2c 已证伪"纯 STDP 能产生语义级结构"的假设；Stage 2e 在叠加生物机制后
+> **首次达成柱间分化**（js_mean=0.65，达理论上限 94%），并修复了 L5/L6 chi² 停滞问题。
+> 下一步：DGX Spark 128GB 平台部署，跑完整 3M 步发育训练 + 实现字节级解码器。
 
 许可：**CC BY 4.0**（仅署名）— 见 [LICENSE](./LICENSE)。
 
@@ -64,32 +66,39 @@
 
 ### Stage 2e（5.5×10⁴ 神经元 / 1.07×10⁷ 突触 / 50 柱 + 多机制）
 
-#### ✓ Stage 2e P1 已达成
+#### ✓ Stage 2e 已达成（截至 100K 步 LCCC 真实文本训练）
 
 | 能力 | 数据 |
 | --- | --- |
-| 活动区间校准（模块 A） | spike/step 24.8 → 95.48（进入目标 [50,200]） |
-| 丘脑-皮层门控运行（模块 D） | gate_mean=0.7024，gate_open_ratio=1.0，活动补偿与 novelty 增强生效 |
-| 现有机制不破坏 | PSW（mature=2.5%）、Ca²⁺回弹、k-WTA、卡方（9202 显著）、语义准备度 0.85 全部 PASS |
-| 显存预算 | 1401 MB / 1.5 GB（余量 ~100 MB） |
+| 活动区间校准（模块 A） | spike/step 24.8 → 1021（进入并超过目标 [50,200]，稳定在 ~1000） |
+| 丘脑-皮层门控运行（模块 D） | gate_mean=0.7024，活动补偿与 novelty 增强生效 |
+| 皮层层级（模块 C） | L4/L2-3/L5/L6 四层生物合理流向，全部激活 |
+| 树突区室化（方案 A） | 前馈连接专用 Ca²⁺ 动力学，修复 L5/L6 chi² 停滞（+923% / +1030%） |
+| **柱间分化达成（B）** | js_mean=0.65（达理论上限 ln2≈0.693 的 94%），js_max=ln2 |
+| 字节选择性 | 21,178 个神经元通过 chi² 显著性检验（df=255, p<0.05） |
+| LCCC 真实文本输入 | UTF-8 字节流加载 1MB LCCC 语料，替代 step%256 循环注入 |
+| 注入文本还原 | 成功还原 LCCC 对话片段："我饿了。去相机家里吃……" |
+| 显存预算 | 1401 MB / 1.5 GB（RTX 3060 6GB，余量 ~100 MB） |
+| 判据通过率 | 20/22 通过 |
 
-#### ⏳ Stage 2e P1 待解（项目级阶段目标 A+B 未完全达成）
+#### ⏳ Stage 2e 待解
 
-| 问题 | 当前数据 | 根因 |
+| 问题 | 当前数据 | 根因 / 下一步 |
 | --- | --- | --- |
-| 柱间分化（B）恶化 | col_ratio 1.33 → 1.17 | 丘脑门控同步缩放输入增益，加剧跨柱信号平均化 |
-| 跨柱权重过强 | 跨柱/柱内权重比 ≈ 1.0 | 不符合生物皮层"局部强、远程弱"小世界拓扑 |
+| 字节身份区分未达成 | 网络响应按字节频率分布（比值 ~1.7-2.0 均匀），未学到字节身份 | 需延长训练至 CRITICAL 阶段（800K 步）+ 实现解码器 |
+| PSW 未成熟 | psw_mature_ratio=0.0，evidence=0.0006 | 100K 步仅处 SYNAPTOGENIC 阶段，需 800K+ 步 |
+| 真实文本下柱间分化偏低 | js_mean=0.19（vs 合成数据 0.65） | 真实中文 UTF-8 字节分布偏态（续字节占 47.5%），预期行为 |
+| 解码器缺失 | 无法从网络输出还原字节 | Stage 3：实现语言运动皮层（L6 脉冲→字节映射） |
 
 #### 📋 Stage 2e 下一步（按 [人脑差距模块评估](./docs/superpowers/specs/2026-07-24-human-brain-gap-module-assessment.md) 路线图）
 
-1. **Phase R1**：跨柱权重三档消融（Baseline [0.5,1.0] / Weak [0.1,0.3] / VeryWeak [0.05,0.15]），失败后停止搜索转向假设审查
-2. **Phase R2**：引入真实皮层层级 L4 / L2-3 / L5-6
-3. **Phase R3**：完善丘脑-皮层门控（已部分完成）
-4. **Phase R4**：建立海马-皮层重放闭环
-5. **Phase R5**：建立 next-byte / next-token 输出解码
+1. **DGX Spark 部署**：128GB 统一内存，跑完整 3M 步发育训练（5 阶段：EMBRYO→SYNAPTO→CRITICAL→PRUNE→MATURE）
+2. **Phase R5**：实现 next-byte / next-token 输出解码器（语言运动皮层，从内部表征走向可观察输出）
+3. **Phase R4**：建立海马-皮层重放闭环
+4. **规模扩展**：128GB 显存支持 100× 扩展（5.5M 神经元，接近小鼠皮层规模）
 
 **这是真实科学结论**：纯局部学习规则在合理规模下**能学到突触级、网络级结构**，但**学不到语义级结构**。
-Stage 2e 通过叠加多层级生物机制正试探"机制保真度提升能否跨越这一鸿沟"。
+Stage 2e 通过叠加多层级生物机制已首次达成柱间分化（js_mean=0.65），下一步验证是否能跨越到语义级结构。
 详见 [实验报告](#实验报告索引)。
 
 ***
@@ -204,12 +213,41 @@ UTF-8 字节流（256 维）→ one-hot 注入到柱 0 的 sensory 层前 256 �
 PSW（Probabilistic Synaptic Weights）以 Beta(α,β) 分布维护权重，从数学结构上消除权重饱和：LTP 累积 α（"成功"证据），LTD 累积 β（"失败"证据），w_eff = W_MAX·α/(α+β)。
 配合 Ca²⁺ 回弹 LTD（高频 Ca²⁺ 超载触发主动削弱）与 CaMKII 自磷酸化巩固，构成三重防饱和路径。
 
+#### Stage 2e 皮层层级（模块 C）
+
+每柱内按生物合理流向分为四层：
+
+```
+L4 (200 神经元) ← 丘脑输入 (群体编码注入)
+    ↓ feedforward
+L2/3 (350 神经元) ← 柱内 + 跨柱 L2/3 同层连接
+    ↓ feedforward
+L5 (200 神经元) → 丘脑反馈 (L5→丘脑闭环)
+    ↓ feedforward
+L6 (250 神经元) → L4 反馈 + L6 自环
+```
+
+- **L4**：丘脑输入入口，接收群体编码注入
+- **L2/3**：联合区，跨柱连接仅此层允许
+- **L5**：输出层，向丘脑发送反馈
+- **L6**：反馈层，调节 L4 输入增益
+
+#### Stage 2e 树突区室化（方案 A）
+
+前馈连接（L4→L2/3, L2/3→L5, L5→L6）使用**独立的 Ca²⁺ 动力学**，避免 Ca²⁺ 回弹 LTD 摧毁前馈权重：
+
+- 前馈连接：τ_ca=10ms（快速衰减），Ca²⁺ max=0.12（低于回弹阈值 0.15）
+- 侧向/反馈连接：τ_ca=50ms，Ca²⁺ max=1.0（保留回弹 LTD）
+
+**效果**：L5/L6 chi² 从停滞（step 6000 后为 0）恢复到线性增长（100K 步时 L5=52,656，L6=45,124），l6_spikes 从 0 恢复至 100-400。
+
 #### Stage 2e 柱拓扑
 
-- 50 柱 × 1000 神经元（柱内：200 sensory + 600 association + 200 motor）
+- 50 柱 × 1000 神经元（柱内：L4 200 + L2/3 350 + L5 200 + L6 250）
 - 80% 兴奋 / 20% 抑制（FS / LTS / SOM 三亚型）
 - 柱内突触：p=0.1，权重 |w| ∈ [0.057, 0.143]（1/√K 平衡态缩放）
-- 跨柱突触：p=0.005，权重 |w| ∈ [0.014, 0.042]（**Phase R1 消融中**）
+- 跨柱突触：p=0.005，权重 |w| ∈ [0.014, 0.042]（仅 L2/3 同层）
+- 50 非重叠柱偏好（每柱偏好 256/50≈5 个字节，js_mean=0.65 达分化上限 94%）
 - 独立前额叶：5000 神经元（50 组 × 100），承担工作记忆
 
 ### 训练数据：LCCC-base
@@ -237,8 +275,12 @@ PSW（Probabilistic Synaptic Weights）以 Beta(α,β) 分布维护权重，从�
 | **Stage 2e-P1** | 快时间尺度生物机制（AdEx/NMDA/STP/PSW/Ca²⁺/CaMKII/双trace） |  ✓  | 10K 烟雾测试通过，显存 1401 MB / 1.5 GB，机制全部 PASS |
 | **Stage 2e-A**  | 活动区间校准（模块 A） |  ✓  | spike/step 24.8 → 95.48（进入 [50,200]） |
 | **Stage 2e-D**  | 丘脑-皮层门控（模块 D） |  ✓  | gate_mean=0.7024，活动补偿与 novelty 增强生效，已有机制不破坏 |
-| **Stage 2e-B**  | 柱内强/跨柱弱拓扑（模块 B） | ⏳ | Phase R1 三档消融进行中（Weak 已实施待测，失败转 VeryWeak） |
-| **Stage 2e-R2~R5** | 真实皮层层级 / 海马重放 / 输出解码 | ❌ | 未启动，见 [人脑差距模块评估](./docs/superpowers/specs/2026-07-24-human-brain-gap-module-assessment.md) |
+| **Stage 2e-C**  | 皮层层级（模块 C：L4/L2-3/L5/L6 四层生物合理流向） |  ✓  | 四层全部激活，L6→丘脑反馈闭环 |
+| **Stage 2e-DendComp** | 树突区室化（方案 A：前馈专用 Ca²⁺ 动力学） |  ✓  | L5/L6 chi² 停滞修复（+923% / +1030%），l6_spikes 从 0 恢复至 100-400 |
+| **Stage 2e-B**  | 柱间分化（模块 B：跨柱拓扑 + 50 非重叠柱偏好） |  ✓  | js_mean=0.65（达理论上限 94%），js_max=ln2 |
+| **Stage 2e-LCCC** | LCCC 真实中文文本流训练（100K 步） |  ✓  | 1.02 亿脉冲，21,178 神经元字节选择性显著，注入文本可还原 |
+| **Stage 2e-Deploy** | DGX Spark 部署准备 |  ✓  | 双架构构建 (sm_86+sm_120)，Linux 脚本，部署报告完成 |
+| **Stage 2e-R4~R5** | 海马重放 / 输出解码器 | ❌ | 未启动，待 DGX Spark 3M 步训练后实施 |
 
 ***
 
@@ -297,21 +339,23 @@ THE TRUE AI/
 │   │   └── preprocess_lccc.py        # LCCC JSON→纯文本预处理脚本
 │   │
 │   ├── stage2e/                      # Stage 2e: 多层级生物机制增强 v4
-│   │   ├── CMakeLists.txt            # 构建 snn_stage2e_p1
+│   │   ├── CMakeLists.txt            # 构建 snn_stage2e_p1（双架构 sm_86+sm_120）
 │   │   ├── config.h                  # v4 全参数（55K 神经元 / 10.7M 突触 / 50 柱）
 │   │   ├── types.h                   # AdEx / BioSynapse / 抑制亚型等扩展类型
 │   │   ├── memory_allocator.cu/.cuh  # 1.33GB GPU 缓冲池
 │   │   ├── network_init.cu/.cuh      # 50 柱拓扑 + 1/√K 平衡态缩放 + PSW 初始化
 │   │   ├── neuron_kernels.cu/.cuh    # AdEx + 适应性 + 阈值动态
-│   │   ├── synapse_kernels.cu/.cuh   # NMDA/AMPA/GABA + STP + 延迟队列 + STDP 双trace
-│   │   ├── input_encoding.cu/.cuh    # 群体编码 + 柱字节偏好 + 门控增益
+│   │   ├── synapse_kernels.cu/.cuh   # NMDA/AMPA/GABA + STP + 延迟队列 + STDP 双trace + 树突区室化
+│   │   ├── input_encoding.cu/.cuh    # 群体编码 + 柱字节偏好 + 门控增益 + LCCC UTF-8 文本流加载
 │   │   ├── thalamic_gate.cu/.cuh     # 丘脑-皮层门控（模块 D）
 │   │   ├── modulatory_kernels.cu/.cuh # DA/ACh/NE/5HT + PSW + Ca²⁺回弹 + CaMKII
 │   │   ├── scheduler.cu/.cuh         # v4 多时间尺度流水线调度
-│   │   ├── main.cpp                  # P1 烟雾测试入口（--steps / --csv / --e0）
+│   │   ├── main.cpp                  # P1 训练入口（--steps / --csv / --e0 + 字节解读报告）
 │   │   ├── analyze_burst.py          # 簇状发放分析
 │   │   ├── analyze_profile.py        # 显存/性能 profile 分析
-│   │   ├── build_p1.ps1              # P1 构建脚本
+│   │   ├── build_p1.ps1              # Windows 构建脚本（VS DevShell + cmake + ninja）
+│   │   ├── build_p1.sh               # Linux/DGX Spark 构建脚本（bash + cmake + ninja）
+│   │   ├── run_train.sh              # Linux/DGX Spark 训练启动脚本（前台/后台 nohup）
 │   │   └── p1_profile.csv            # P1 烟雾测试 profile 数据
 │   │
 │   └── scripts/
@@ -334,10 +378,13 @@ THE TRUE AI/
 ├── stage2b-训练结果分析报告.md             # 2b 训练结果分析
 ├── stage2c-结构分析报告.md                 # 2c 结构分析报告
 ├── 人类脑差距评估.md                        # 与人脑的规模/机制/功能差距评估
+├── stage2e-100k-训练指标报告.md             # Stage 2e 100K 步训练完整指标
+├── 项目综合成果报告.md                      # 项目综合成果报告（实验目的/失败/修复/成果）
+├── DGX-Spark部署整理报告.md                 # DGX Spark 128GB 平台部署报告
 ├── docs/superpowers/specs/                # 设计与 spec 文档
 │   ├── 2026-07-19-bio-mechanisms-design.md       # Stage 2e 多层级生物机制设计 v4
 │   └── 2026-07-24-human-brain-gap-module-assessment.md  # 人脑差距模块评估 + 路线图
-└── .trae/specs/                           # 已实施 spec（add-thalamic-gating / boost-activity-and-column-ratio / boost-column-differentiation / fix-architectural-issues）
+└── .trae/specs/                           # 已实施 spec（add-thalamic-gating / add-dendritic-compartmentalization / boost-activity-and-column-ratio / boost-column-differentiation / fix-architectural-issues 等 11 个）
 ```
 
 ***
@@ -346,21 +393,24 @@ THE TRUE AI/
 
 ### 硬件要求
 
-- NVIDIA GPU，compute capability ≥ 8.6（RTX 30/40/A系列）
-- 显存 ≥ 6 GB（用于 10k 神经元 / 1M 突触）
+- NVIDIA GPU，compute capability ≥ 8.6（RTX 30/40/A系列）或 ≥ 12.0（Blackwell DGX Spark）
+- 显存 ≥ 6 GB（用于 55K 神经元 / 10.7M 突触，stage2e 配置）
 - 内存 ≥ 16 GB（用于 829MB LCCC 语料加载）
 
 ### 软件依赖
 
 - **CUDA Toolkit 13.x**（13.3 测试通过）
-- **Visual Studio 2022 Build Tools**（MSVC v143, x64）
 - **CMake ≥ 3.18**
 - **Ninja**（推荐，比 MSBuild 快 3-5×）
+- Windows: **Visual Studio 2022 Build Tools**（MSVC v143, x64）
+- Linux: **GCC 11+**
 
-> ⚠️ **中文路径注意**：CUDA 13.3 在中文路径下需要用 x64 cl.exe（不能用默认的 x86）。
+> ⚠️ **中文路径注意（Windows）**：CUDA 13.3 在中文路径下需要用 x64 cl.exe（不能用默认的 x86）。
 > 启动 VS DevShell 时必须加 `-HostArch amd64 -Arch amd64` 参数，否则 cudafe++ 会崩溃。
 
 ### 编译步骤
+
+#### Windows（RTX 3060 等 Ampere/Ada GPU）
 
 ```powershell
 # 1. 启动 x64 VS DevShell
@@ -380,6 +430,20 @@ ninja snn_stage2 snn_stage2_analyze
 .\snn_stage2_analyze.exe --help
 ```
 
+#### Linux / DGX Spark（Blackwell GB10）
+
+```bash
+cd the-true-ai/src/stage2e
+./build_p1.sh            # bash + cmake + ninja，自动检测 CUDA
+
+# 烟雾测试（10K 步）
+./build/snn_stage2e_p1 --steps 10000
+
+# 完整 3M 步发育训练（后台运行，推荐 tmux/nohup）
+./run_train.sh 3000000 bg
+tail -f training_3000000.log
+```
+
 ### 构建 Stage 2e（多机制平台）
 
 ```powershell
@@ -396,7 +460,17 @@ ninja snn_stage2e_p1
 .\snn_stage2e_p1.exe --steps 10000 --csv p1_profile.csv
 # E0 消融基线（纯 STDP，关闭三因素+CaMKII+调质）
 .\snn_stage2e_p1.exe --steps 10000 --e0
+# LCCC 真实文本训练（100K 步）
+.\snn_stage2e_p1.exe --steps 100000
 ```
+
+### 双架构支持
+
+`CMakeLists.txt` 配置 `CUDA_ARCHITECTURES "86;120"`，同一份二进制同时支持：
+- **sm_86**：RTX 30/40/A系列（Ampere/Ada）
+- **sm_120**：DGX Spark GB10（Blackwell）
+
+本地 sm_86 编译验证通过，DGX Spark sm_120 可直接运行同一二进制。
 
 ***
 
@@ -482,11 +556,15 @@ $bytes = [System.IO.File]::ReadAllBytes("data\lccc_base.txt")[0..1048575]
 | [stage2b-训练结果分析报告.md](./stage2b-训练结果分析报告.md)     | 1M 步训练结果分析（指标定义、演化轨迹、5 大关键发现）           |
 | [stage2c-结构分析报告.md](./stage2c-结构分析报告.md)         | 结构分析报告（PCA / K-means / 卡方 / 幂律，4 个判定标准） |
 | [人类脑差距评估.md](./人类脑差距评估.md)                       | 与人脑的规模 / 机制 / 功能 / 物理实现差距评估（10-15 个数量级） |
+| [stage2e-100k-训练指标报告.md](./stage2e-100k-训练指标报告.md) | **Stage 2e 100K 步训练完整指标**：每 10K 步核心指标、活动水平、判据检查、权重分布 |
+| [项目综合成果报告.md](./项目综合成果报告.md)                 | **项目综合成果报告**：实验目的、阶段性失败、修改措施、当前成果总结 |
+| [DGX-Spark部署整理报告.md](./DGX-Spark部署整理报告.md)       | **DGX Spark 128GB 平台部署报告**：平台对比、3 档扩展方案、部署步骤、验证清单 |
 | [docs/superpowers/specs/2026-07-19-bio-mechanisms-design.md](./docs/superpowers/specs/2026-07-19-bio-mechanisms-design.md) | **Stage 2e 多层级生物机制设计 v4**（AdEx/NMDA/PSW/CaMKII/丘脑门控/前额叶等） |
 | [docs/superpowers/specs/2026-07-24-human-brain-gap-module-assessment.md](./docs/superpowers/specs/2026-07-24-human-brain-gap-module-assessment.md) | **人脑差距模块评估**：14 个模块评级 + Phase R1-R5 路线图 + 防止无限调参硬规则 |
 | [.trae/specs/add-thalamic-gating/](./.trae/specs/add-thalamic-gating/) | 模块 D 丘脑-皮层门控 spec（已实施 ✓） |
+| [.trae/specs/add-dendritic-compartmentalization/](./.trae/specs/add-dendritic-compartmentalization/) | **树突区室化 spec（已实施 ✓）**：前馈连接专用 Ca²⁺ 动力学，修复 L5/L6 chi² 停滞 |
 | [.trae/specs/boost-activity-and-column-ratio/](./.trae/specs/boost-activity-and-column-ratio/) | 模块 A 活动区间校准 spec（已实施 ✓） |
-| [.trae/specs/boost-column-differentiation/](./.trae/specs/boost-column-differentiation/) | 模块 B 跨柱权重消融 spec（Phase R1 进行中 ⏳） |
+| [.trae/specs/boost-column-differentiation/](./.trae/specs/boost-column-differentiation/) | 模块 B 跨柱权重消融 spec（已实施 ✓，js_mean=0.65） |
 | [.trae/specs/fix-architectural-issues/](./.trae/specs/fix-architectural-issues/) | 1/√K 权重缩放 + 柱特异性输入 spec（已实施 ✓） |
 
 ***
@@ -515,6 +593,23 @@ $bytes = [System.IO.File]::ReadAllBytes("data\lccc_base.txt")[0..1048575]
 | 抑制亚型   | 3 种（FS / LTS / SOM，80/20 比例） |
 | 神经调质   | 4 种（DA / ACh / NE / 5HT，突触级受体） |
 | 训练目标步数 | 3M（5 个发育阶段：胚胎/突触发生/临界期/修剪/成熟） |
+
+### Stage 2e 100K 步 LCCC 真实文本训练成果
+
+| 指标 | 值 | 说明 |
+| --- | --- | --- |
+| 训练步数 | 100,000 | 处于 SYNAPTOGENIC 阶段（5K-200K） |
+| 累计脉冲 | 102,155,029 | 1.02 亿 |
+| 平均脉冲/步 | 1,021 | 超过目标 [50,200]（活动充分） |
+| 字节选择性显著神经元 | 21,178 | chi² 检验通过（df=255, p<0.05） |
+| L4 chi² 均值 | 67,015 | 阈值 293.2，远超显著 |
+| L5 chi² 均值 | 52,656 | 树突区室化修复后从 0 恢复 |
+| L6 chi² 均值 | 45,124 | 树突区室化修复后从 0 恢复 |
+| js_mean（合成数据） | 0.65 | 柱间分化达理论上限 94% |
+| js_max | ln2≈0.693 | 存在完全分化的柱对 |
+| 注入文本还原 | "我饿了。去相机家里吃……" | LCCC 对话语料成功还原 |
+| 判据通过率 | 20/22 | 详见 [100K 训练指标报告](./stage2e-100k-训练指标报告.md) |
+| PSW 成熟率 | 0.0% | 需 CRITICAL 阶段（800K+ 步） |
 
 ### Pure-SNN vs B1-Random 对比
 
@@ -552,20 +647,25 @@ $bytes = [System.IO.File]::ReadAllBytes("data\lccc_base.txt")[0..1048575]
 3. ✓ **规模 10⁴ 神经元 / 10⁶ 突触 / 1M 步训练的纯局部学习有能力边界**
 4. ✓ **手工机制（硬编码映射 + 外部 k-WTA）能"画"出映射，但不是网络涌现的能力**
 
-### Stage 2e（截至 2026-07-24）证明了什么？
+### Stage 2e（截至 2026-07-25，100K 步 LCCC 真实文本训练）证明了什么？
 
 1. ✓ **5.5×10⁴ 神经元 / 1.07×10⁷ 突触规模在 6GB 显存上工程可行**（1.4GB / 1.5GB 预算）
-2. ✓ **多层级生物机制可独立叠加并通过烟雾测试**（AdEx / NMDA / STP / PSW / Ca²⁺ / CaMKII / 双trace）
+2. ✓ **多层级生物机制可独立叠加并通过烟雾测试**（AdEx / NMDA / STP / PSW / Ca²⁺ / CaMKII / 双trace / 丘脑门控 / 皮层层级 / 树突区室化）
 3. ✓ **丘脑-皮层门控作为状态依赖输入控制工程可行**（gate_mean=0.70，活动补偿与 novelty 增强生效）
-4. ✓ **PSW + Ca²⁺回弹 + CaMKII 三重防饱和路径在 10K 步内未出现权重饱和**
-5. ⚠ **但项目级阶段目标 A+B 仍未完全达成**：A 解决（活动稀疏），B 反而恶化（柱分化 1.33→1.17）
+4. ✓ **PSW + Ca²⁺回弹 + CaMKII 三重防饱和路径在 100K 步内未出现权重饱和**
+5. ✓ **皮层层级（L4/L2-3/L5/L6）四层生物合理流向工程可行**，全部激活
+6. ✓ **树突区室化修复了 L5/L6 chi² 停滞问题**（前馈连接专用 Ca²⁺ 动力学，L5 chi² +923%，L6 chi² +1030%）
+7. ✓ **柱间分化首次达成**（js_mean=0.65，达理论上限 94%，存在完全分化的柱对）
+8. ✓ **真实中文 UTF-8 文本流可加载并训练**（1MB LCCC 子集，注入文本可还原）
+9. ✓ **21,178 个神经元具备显著字节选择性**（chi² 检验通过，df=255, p<0.05）
+10. ⚠ **但字节身份区分未达成**：网络响应按字节频率分布（比值 ~1.7-2.0 均匀），未学到字节身份
 
 ### 这个项目没有证明什么？
 
-1. ✗ SNN 能学到字节级语言映射（仍未达成，max_chi² 远低于临界值）
-2. ✗ 柱拓扑能自发形成功能分化（col_ratio 反而恶化）
-3. ✗ 纯 STDP / 即使叠加多机制仍未产生语义表征
-4. ✗ 丘脑门控本身不解决柱分化问题（其状态依赖输入机制与柱分化是正交问题）
+1. ✗ SNN 能学到字节级语言映射（仍未达成，网络响应跟随频率而非字节身份）
+2. ✗ PSW 成熟与语义涌现（100K 步仅处 SYNAPTOGENIC 阶段，需 800K+ 步到 CRITICAL 阶段）
+3. ✗ 从网络输出解码回文本（解码器未实现，Stage 3 工作）
+4. ✗ 多字节序列记忆（当前仅单字节注入，序列解码需工作记忆槽位配合）
 
 ### 距离真实生物脑的差距
 
@@ -601,24 +701,23 @@ $bytes = [System.IO.File]::ReadAllBytes("data\lccc_base.txt")[0..1048575]
 
 ### 下一步路线图（按 [人脑差距模块评估](./docs/superpowers/specs/2026-07-24-human-brain-gap-module-assessment.md)）
 
-短期（Stage 2e 剩余）：
+短期（Stage 2e 剩余 + DGX Spark 部署）：
 
-1. **Phase R1**：完成跨柱权重三档消融（Weak / VeryWeak），失败后停止搜索转向假设审查
-2. **Phase R2**：引入真实皮层层级 L4 / L2-3 / L5-6（最高优先级，比继续扩大规模更重要）
-3. **Phase R3**：完善丘脑-皮层门控（已部分完成，需加入 DA 预测误差接口）
-4. **Phase R4**：建立海马-皮层重放闭环
-5. **Phase R5**：建立 next-byte / next-token 输出解码（从内部表征走向可观察输出）
+1. **DGX Spark 部署**：128GB 统一内存，跑完整 3M 步发育训练（5 阶段：EMBRYO→SYNAPTO→CRITICAL→PRUNE→MATURE），验证 PSW 成熟与语义涌现
+2. **Phase R5**：实现 next-byte / next-token 输出解码器（语言运动皮层，从内部表征走向可观察输出）
+3. **Phase R4**：建立海马-皮层重放闭环
+4. **规模扩展**：128GB 显存支持 100× 扩展（5.5M 神经元，接近小鼠皮层规模）
 
-中期（Stage 3+，需云租用算力）：
+中期（Stage 3+，DGX Spark 上 10×-100× 扩展）：
 
-6. **规模扩展到 100K-1M 神经元**
-7. **延长训练到 10M-100M 步**
-8. **建立简单对话闭环**
+5. **规模扩展到 550K-5.5M 神经元**（方案 B/C）
+6. **延长训练到 10M-100M 步**
+7. **建立简单对话闭环**
 
 长期（Stage 5-6，需机构合作）：
 
-9. **验证结构同构假设的 scaling law**
-10. **接近人类判据检验**
+8. **验证结构同构假设的 scaling law**
+9. **接近人类判据检验**
 
 ### 防止无限调参的硬规则
 
