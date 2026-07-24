@@ -433,15 +433,20 @@ ninja snn_stage2 snn_stage2_analyze
 #### Linux / DGX Spark（Blackwell GB10）
 
 ```bash
-cd the-true-ai/src/stage2e
-./build_p1.sh            # bash + cmake + ninja，自动检测 CUDA
+cd pure-snn-language
+src/stage2e/build_p1.sh  # 自动发现 /usr/local/cuda；无 Ninja 时回退到 Make
 
 # 烟雾测试（10K 步）
-./build/snn_stage2e_p1 --steps 10000
+src/stage2e/build/snn_stage2e_p1 --steps 10000 \
+  --text data/lccc_sample_1mb.txt --checkpoint-interval 0
 
-# 完整 3M 步发育训练（后台运行，推荐 tmux/nohup）
-./run_train.sh 3000000 bg
-tail -f training_3000000.log
+# 完整 3M 步发育训练（每 50K 完整 checkpoint，默认保留最近 3 个）
+src/stage2e/run_train.sh 3000000 bg
+tail -f src/stage2e/training_3000000.log
+
+# 从 800K checkpoint 恢复；--steps 是绝对停止步数
+src/stage2e/run_train.sh 3000000 bg \
+  src/stage2e/checkpoints/ckpt_step800000.snn2e
 ```
 
 ### 构建 Stage 2e（多机制平台）
@@ -471,6 +476,29 @@ ninja snn_stage2e_p1
 - **sm_120**：DGX Spark GB10（Blackwell）
 
 本地 sm_86 编译验证通过，DGX Spark sm_120 可直接运行同一二进制。
+
+### Stage 2e 长训参数
+
+- `--steps N`：绝对停止步数；恢复到 800K 后传 3M，表示继续到 3M。
+- `--text PATH`：UTF-8 字节语料。恢复时大小和 FNV-1a 指纹必须匹配。
+- `--seed N`：拓扑种子；checkpoint 会记录并在恢复时还原。
+- `--device N`：CUDA device 序号。
+- `--checkpoint-dir PATH`：完整 checkpoint 输出目录。
+- `--checkpoint-interval N`：保存间隔，`0` 禁用；默认 50K。
+- `--keep-checkpoints N`：保留最新 N 个，`0` 表示不清理；默认 3。
+- `--resume PATH`：恢复 `.snn2e` 完整状态。
+- `--synthetic-input`：显式启用 `0..255` 循环输入，仅用于烟雾测试；真实语料加载失败时不再静默回退。
+
+Stage 2e v3 checkpoint 包含全部持久 GPU 缓冲、调度器状态和文本游标，写入时使用临时文件、CRC32 payload 校验、完成 footer 和同目录原子改名。收到 `SIGINT`/`SIGTERM` 时会先保存再退出。
+
+无需 CUDA 即可检查 checkpoint 完整性：
+
+```bash
+python src/stage2e/tools/inspect_checkpoint.py \
+  src/stage2e/checkpoints/ckpt_step800000.snn2e --verify
+```
+
+完整的分阶段门禁、科学对照与运维边界见 [DGX Spark 训练实施方案](docs/spark-training-plan.md)。
 
 ***
 

@@ -16,6 +16,7 @@ T* MemoryAllocator::alloc(size_t count, const char* name, size_t* accum_bytes) {
         fprintf(stderr, "[Stage2e] CUDA 分配失败: %s, 需要 %zu 字节 (%.2f MB)\n",
                 name, bytes, bytes / (1024.0 * 1024.0));
         fprintf(stderr, "         错误: %s\n", cudaGetErrorString(err));
+        allocation_failed_ = true;
         return nullptr;
     }
     // 清零 (避免 NaN 传播)
@@ -30,6 +31,7 @@ T* MemoryAllocator::alloc(size_t count, const char* name, size_t* accum_bytes) {
 }
 
 size_t MemoryAllocator::allocate_all() {
+    allocation_failed_ = false;
     printf("[Stage2e P0] 开始分配 GPU 显存...\n");
     printf("  %-34s %10s %8s %10s %10s\n",
            "Buffer", "Count", "Size", "Bytes", "Total MB");
@@ -123,6 +125,10 @@ size_t MemoryAllocator::allocate_all() {
            vram_used_ / (1024.0 * 1024.0),
            vram_used_ / (1024.0 * 1024.0) - 1242.0);
 
+    if (allocation_failed_) {
+        fprintf(stderr, "[Stage2e P0] 一个或多个持久缓冲分配失败\n");
+        return 0;
+    }
     return vram_used_;
 }
 

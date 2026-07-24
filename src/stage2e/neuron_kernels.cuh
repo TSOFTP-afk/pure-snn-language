@@ -36,6 +36,11 @@ struct DelayQueueRuntimeStats {
     int max_slot_depth;
 };
 
+struct DelayQueueCheckpointState {
+    int ring_counter_history[DELAY_STEPS_MAX];
+    DelayQueueRuntimeStats stats;
+};
+
 // 把上一轮写入当前 ring_idx 槽位的延迟电流注入 input_current
 // 内部: 清零 input_current, 启动 delay_inject_kernel, 消费后清空当前槽位计数
 void launch_delay_inject(MemoryAllocator* alloc, int ring_idx);
@@ -52,6 +57,8 @@ void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx);
 
 int delay_queue_last_arrived_events();
 const DelayQueueRuntimeStats& delay_queue_stats();
+bool export_delay_queue_state(DelayQueueCheckpointState* state);
+bool import_delay_queue_state(const DelayQueueCheckpointState& state);
 
 } // namespace stage2e
 

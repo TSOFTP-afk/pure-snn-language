@@ -125,19 +125,23 @@ public:
     // P3-C: 显式触发一次语义聚类评估 (短测末尾由 main.cpp 调用)
     void run_semantic_eval(int step) { launch_semantic_eval(step); }
 
-    // Checkpoint: 保存 d_synapses_ (含 STDP 状态) + d_neuron_byte_counts 到磁盘
-    // 返回 0=成功, 非 0=失败
-    int save_checkpoint(int step, const char* dir = "checkpoints");
+    // 完整 checkpoint: 所有持久 GPU 状态、调度器状态和文本游标。
+    // next_step 表示恢复后第一个尚未执行的绝对 step。
+    int save_checkpoint(int next_step, const char* dir, uint32_t topology_seed);
+    int load_checkpoint(const char* path, int* next_step, uint32_t* topology_seed);
+    int prune_checkpoints(const char* dir, int keep_latest);
 
     float burst_ratio() const {
         return total_steps_ > 0 ? (100.0f * total_burst_steps_ / total_steps_) : 0.0f;
     }
 
 private:
+    friend struct SchedulerCheckpointAccess;
     MemoryAllocator* alloc_;
     NetworkStats2e stats_;
     DevPhaseTable phase_table_;
     int delay_ring_idx_;
+    int last_phase_;
 
     // P1 统计
     int total_steps_;

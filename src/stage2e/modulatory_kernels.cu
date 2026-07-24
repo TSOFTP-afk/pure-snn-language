@@ -166,6 +166,15 @@ static float h_v_s = 0.0f;
 static float h_v_sp = 0.0f;
 static float* d_v_scratch = nullptr;
 
+ModulatoryRuntimeState export_modulatory_runtime_state() {
+    return {h_v_s, h_v_sp};
+}
+
+void import_modulatory_runtime_state(const ModulatoryRuntimeState& state) {
+    h_v_s = state.v_s;
+    h_v_sp = state.v_sp;
+}
+
 static void ensure_v_scratch() {
     if (d_v_scratch == nullptr) {
         cudaMalloc(&d_v_scratch, sizeof(float));

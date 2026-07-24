@@ -64,7 +64,14 @@ struct ModulatoryStats {
     float pred_succ;
 };
 
+struct ModulatoryRuntimeState {
+    float v_s;
+    float v_sp;
+};
+
 ModulatoryStats get_modulatory_stats(MemoryAllocator* alloc);
+ModulatoryRuntimeState export_modulatory_runtime_state();
+void import_modulatory_runtime_state(const ModulatoryRuntimeState& state);
 
 } // namespace stage2e
 

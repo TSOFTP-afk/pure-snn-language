@@ -34,6 +34,7 @@ namespace stage2e {
 static std::string g_text_buffer;
 static size_t g_text_pos = 0;
 static bool g_text_loaded = false;
+static uint64_t g_text_fingerprint = 0;
 
 // 加载 UTF-8 文本语料到全局缓冲
 // 返回: 加载的字节数 (0 表示失败)
@@ -65,6 +66,12 @@ size_t load_text_corpus(const char* filepath) {
 
     g_text_pos = 0;
     g_text_loaded = !g_text_buffer.empty();
+    uint64_t fingerprint = 1469598103934665603ULL;
+    for (unsigned char c : g_text_buffer) {
+        fingerprint ^= c;
+        fingerprint *= 1099511628211ULL;
+    }
+    g_text_fingerprint = fingerprint;
 
     // 统计字节分布 (诊断用)
     int ascii_count = 0, head_count = 0, cont_count = 0;
@@ -106,6 +113,16 @@ uint8_t get_text_byte_at(size_t idx) {
     if (idx >= g_text_buffer.size()) return 0;
     return (uint8_t)g_text_buffer[idx];
 }
+
+size_t text_stream_position() { return g_text_pos; }
+
+bool set_text_stream_position(size_t position) {
+    if (!g_text_loaded || g_text_buffer.empty()) return position == 0;
+    g_text_pos = position % g_text_buffer.size();
+    return true;
+}
+
+uint64_t text_corpus_fingerprint() { return g_text_fingerprint; }
 
 // =============================================================================
 // input_inject_kernel: 群体编码注入

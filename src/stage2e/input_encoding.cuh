@@ -48,6 +48,11 @@ size_t text_corpus_size();
 // 获取文本缓冲指定位置的字节 (越界返回 0)
 uint8_t get_text_byte_at(size_t idx);
 
+// Checkpoint/resume uses the logical corpus cursor, not a raw host pointer.
+size_t text_stream_position();
+bool set_text_stream_position(size_t position);
+uint64_t text_corpus_fingerprint();
+
 } // namespace stage2e
 
 #endif // SNN_STAGE2E_INPUT_ENCODING_CUH

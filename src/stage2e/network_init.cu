@@ -161,10 +161,11 @@ void init_synapses_host(std::vector<BioSynapse>& h_synapses,
                        std::vector<float>& h_weights_cache,
                        std::vector<uint8_t>& h_delay,
                        std::vector<float>& h_alpha,
-                       std::vector<float>& h_beta) {
+                       std::vector<float>& h_beta,
+                       uint32_t seed) {
     // 简单的确定性 PRNG (避免引入 curand 依赖到 host)
-    // 使用 xorshift32, 种子 = 42
-    uint32_t rng = 42;
+    // xorshift32 的零状态会永久锁死，用户传入 0 时映射到固定非零状态。
+    uint32_t rng = seed == 0 ? 0x6D2B79F5u : seed;
     auto next_rng = [&rng]() -> uint32_t {
         rng ^= rng << 13;
         rng ^= rng >> 17;
@@ -480,9 +481,10 @@ int init_synapses(BioSynapse* d_synapses,
                   int* d_csr_col_idx,
                   float* d_weights_cache,
                   uint8_t* d_synapse_delay,
-                  float* d_synapse_alpha,
-                  float* d_synapse_beta,
-                  const NeuronStateAdEx* d_neurons) {
+                   float* d_synapse_alpha,
+                   float* d_synapse_beta,
+                   const NeuronStateAdEx* d_neurons,
+                   uint32_t seed) {
     (void)d_neurons;  // P1 不依赖 d_neurons 内容做初始化
 
     // Host 端构造
@@ -495,7 +497,7 @@ int init_synapses(BioSynapse* d_synapses,
     std::vector<float> h_beta;
 
     printf("[Stage2e P1] 生成突触拓扑 (host 端, ~10.7M 突触)...\n");
-    init_synapses_host(h_syn, h_row, h_col, h_w, h_d, h_alpha, h_beta);
+    init_synapses_host(h_syn, h_row, h_col, h_w, h_d, h_alpha, h_beta, seed);
 
     int n_syn = static_cast<int>(h_syn.size());
     printf("[Stage2e P1] 实际生成: %d 突触, %d row_ptr 项\n", n_syn, static_cast<int>(h_row.size()));
@@ -570,7 +572,7 @@ void init_buffers_zero(MemoryAllocator* alloc) {
 // -----------------------------------------------------------------------------
 // Host: 完整初始化入口
 // -----------------------------------------------------------------------------
-void init_network(MemoryAllocator* alloc) {
+void init_network(MemoryAllocator* alloc, uint32_t seed) {
     printf("[Stage2e P1] === 网络初始化 ===\n");
 
     PersistentBuffers& b = alloc->buffers();
@@ -581,8 +583,8 @@ void init_network(MemoryAllocator* alloc) {
     printf("[Stage2e P1] 初始化突触拓扑 + 延迟 + STP + 调质受体 + PSW...\n");
     int n_syn = init_synapses(b.d_synapses, b.d_csr_row_ptr, b.d_csr_col_idx,
                               b.d_weights_cache, b.d_synapse_delay,
-                              b.d_synapse_alpha, b.d_synapse_beta,
-                              b.d_neurons);
+                               b.d_synapse_alpha, b.d_synapse_beta,
+                               b.d_neurons, seed);
     if (n_syn != N_TOTAL_SYNAPSES_2E) {
         fprintf(stderr, "[Stage2e P1 WARN] 突触数 %d != 目标 %d\n", n_syn, N_TOTAL_SYNAPSES_2E);
     }

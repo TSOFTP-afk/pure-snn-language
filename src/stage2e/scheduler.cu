@@ -21,7 +21,6 @@
 #include <vector>
 #include <algorithm>
 #include <limits>
-#include <direct.h>
 #include <cuda_runtime.h>
 
 namespace stage2e {
@@ -310,7 +309,7 @@ __global__ void p3_column_byte_response_kernel(
 }
 
 BioMechanismScheduler::BioMechanismScheduler(MemoryAllocator* alloc)
-    : alloc_(alloc), stats_{}, delay_ring_idx_(0),
+    : alloc_(alloc), stats_{}, delay_ring_idx_(0), last_phase_(-1),
       total_steps_(0), total_spikes_accum_(0), inject_spikes_accum_(0),
       min_spikes_per_step_(INT_MAX), max_spikes_per_step_(0),
       total_burst_steps_(0), total_single_neuron_burst_spikes_(0),
@@ -336,40 +335,41 @@ BioMechanismScheduler::BioMechanismScheduler(MemoryAllocator* alloc)
     printf("[Stage2e P1] 调度器初始化完成\n");
     memset(&stats_, 0, sizeof(stats_));
     // 分配 device 端 spike 计数器
-    cudaMalloc(&d_spike_counter_, sizeof(int));
-    cudaMemset(d_spike_counter_, 0, sizeof(int));
-    cudaMalloc(&d_single_neuron_burst_counter_, sizeof(int));
-    cudaMemset(d_single_neuron_burst_counter_, 0, sizeof(int));
-    cudaMalloc(&d_p3_column_spikes_, N_COLUMNS_2E * sizeof(int));
-    cudaMemset(d_p3_column_spikes_, 0, N_COLUMNS_2E * sizeof(int));
-    cudaMalloc(&d_p3_kwta_stats_, 3 * sizeof(int));
-    cudaMemset(d_p3_kwta_stats_, 0, 3 * sizeof(int));
+    CUDA_CHECK_2E(cudaMalloc(&d_spike_counter_, sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_spike_counter_, 0, sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_single_neuron_burst_counter_, sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_single_neuron_burst_counter_, 0, sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_p3_column_spikes_, N_COLUMNS_2E * sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_p3_column_spikes_, 0, N_COLUMNS_2E * sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_p3_kwta_stats_, 3 * sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_p3_kwta_stats_, 0, 3 * sizeof(int)));
     // P3-C: 50 柱 × 256 字节响应缓冲
-    cudaMalloc(&d_p3_column_byte_responses_, N_COLUMNS_2E * 256 * sizeof(int));
-    cudaMemset(d_p3_column_byte_responses_, 0, N_COLUMNS_2E * 256 * sizeof(int));
+    CUDA_CHECK_2E(cudaMalloc(&d_p3_column_byte_responses_, N_COLUMNS_2E * 256 * sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_p3_column_byte_responses_, 0, N_COLUMNS_2E * 256 * sizeof(int)));
     // 丘脑-皮层门控: 分配缓冲区并初始化
-    cudaMalloc(&d_gate_states_, N_COLUMNS_2E * sizeof(ThalamicGateState));
-    cudaMalloc(&d_byte_history_, 256 * sizeof(unsigned int));
-    cudaMalloc(&d_gate_stats_, 4 * sizeof(float));
-    cudaMemset(d_byte_history_, 0, 256 * sizeof(unsigned int));
-    cudaMemset(d_gate_stats_, 0, 4 * sizeof(float));
+    CUDA_CHECK_2E(cudaMalloc(&d_gate_states_, N_COLUMNS_2E * sizeof(ThalamicGateState)));
+    CUDA_CHECK_2E(cudaMalloc(&d_byte_history_, 256 * sizeof(unsigned int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_gate_stats_, 4 * sizeof(float)));
+    CUDA_CHECK_2E(cudaMemset(d_byte_history_, 0, 256 * sizeof(unsigned int)));
+    CUDA_CHECK_2E(cudaMemset(d_gate_stats_, 0, 4 * sizeof(float)));
     init_thalamic_gate(d_gate_states_);
 
     // Phase R2 模块 C (Task 6.1): 分配 L6 spike count 缓冲 + 层间指标缓冲
-    cudaMalloc(&d_l6_column_spikes_, N_COLUMNS_2E * sizeof(int));
-    cudaMemset(d_l6_column_spikes_, 0, N_COLUMNS_2E * sizeof(int));
-    cudaMalloc(&d_layer_byte_responses_, 5 * 256 * sizeof(int));
-    cudaMemset(d_layer_byte_responses_, 0, 5 * 256 * sizeof(int));
-    cudaMalloc(&d_layer_sig_count_, 5 * sizeof(int));
-    cudaMemset(d_layer_sig_count_, 0, 5 * sizeof(int));
-    cudaMalloc(&d_layer_act_count_, 5 * sizeof(int));
-    cudaMemset(d_layer_act_count_, 0, 5 * sizeof(int));
-    cudaMalloc(&d_layer_chi2_sum_, 5 * sizeof(float));
-    cudaMemset(d_layer_chi2_sum_, 0, 5 * sizeof(float));
-    cudaMalloc(&d_injections_per_byte_, 256 * sizeof(float));
+    CUDA_CHECK_2E(cudaMalloc(&d_l6_column_spikes_, N_COLUMNS_2E * sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_l6_column_spikes_, 0, N_COLUMNS_2E * sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_layer_byte_responses_, 5 * 256 * sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_layer_byte_responses_, 0, 5 * 256 * sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_layer_sig_count_, 5 * sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_layer_sig_count_, 0, 5 * sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_layer_act_count_, 5 * sizeof(int)));
+    CUDA_CHECK_2E(cudaMemset(d_layer_act_count_, 0, 5 * sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_layer_chi2_sum_, 5 * sizeof(float)));
+    CUDA_CHECK_2E(cudaMemset(d_layer_chi2_sum_, 0, 5 * sizeof(float)));
+    CUDA_CHECK_2E(cudaMalloc(&d_injections_per_byte_, 256 * sizeof(float)));
     // 初始化为均匀分布 (期望每个字节注入次数相等)
     std::vector<float> h_inj(256, 1.0f / 256.0f);
-    cudaMemcpy(d_injections_per_byte_, h_inj.data(), 256 * sizeof(float), cudaMemcpyHostToDevice);
+    CUDA_CHECK_2E(cudaMemcpy(d_injections_per_byte_, h_inj.data(),
+                             256 * sizeof(float), cudaMemcpyHostToDevice));
     // host 端层间指标初始化
     for (int i = 0; i < 5; ++i) {
         layer_activation_delay_[i] = 0.0;
@@ -397,89 +397,6 @@ BioMechanismScheduler::~BioMechanismScheduler() {
     if (d_layer_act_count_) cudaFree(d_layer_act_count_);
     if (d_layer_chi2_sum_) cudaFree(d_layer_chi2_sum_);
     if (d_injections_per_byte_) cudaFree(d_injections_per_byte_);
-}
-
-// ==================== Checkpoint 保存 ====================
-// 项目记忆硬约束: 必须保存完整 d_synapses_ (含 STDP 状态), 而非 d_weights_
-// 保存内容 (v2 含 PSW):
-//   1. 头部: magic(4B) + version(4B) + step(4B) + n_synapses(4B) + n_neurons(4B)
-//   2. d_synapses_: N_TOTAL_SYNAPSES_2E × 80B = 856MB (含 weight + STDP + STP + eligibility 等)
-//   3. d_neuron_byte_counts: N_TOTAL_NEURONS_2E × 256 × 4B = 56MB (字节响应统计)
-//   4. d_synapse_alpha: N_TOTAL_SYNAPSES_2E × 4B = 42.8MB (PSW LTP 证据)
-//   5. d_synapse_beta:  N_TOTAL_SYNAPSES_2E × 4B = 42.8MB (PSW LTD 证据)
-// 总计约 998MB, NVMe SSD 写入约 3-4 秒
-int BioMechanismScheduler::save_checkpoint(int step, const char* dir) {
-    PersistentBuffers& buf = alloc_->buffers();
-    if (!buf.d_synapses || !buf.d_neuron_byte_counts ||
-        !buf.d_synapse_alpha || !buf.d_synapse_beta) {
-        fprintf(stderr, "[Checkpoint] FAIL: device buffer 为空\n");
-        return 1;
-    }
-
-    // 创建目录 (若不存在)
-    _mkdir(dir);
-
-    // 生成文件名
-    char filepath[512];
-    snprintf(filepath, sizeof(filepath), "%s/ckpt_step%d.bin", dir, step);
-
-    FILE* fp = fopen(filepath, "wb");
-    if (!fp) {
-        fprintf(stderr, "[Checkpoint] FAIL: 无法创建文件 %s\n", filepath);
-        return 2;
-    }
-
-    // 头部 (version=2: 含 PSW alpha/beta)
-    const uint32_t magic = 0x53434B50;  // "SCKP"
-    const uint32_t version = 2;
-    const uint32_t n_syn = N_TOTAL_SYNAPSES_2E;
-    const uint32_t n_neu = N_TOTAL_NEURONS_2E;
-    fwrite(&magic, sizeof(uint32_t), 1, fp);
-    fwrite(&version, sizeof(uint32_t), 1, fp);
-    fwrite((const void*)&step, sizeof(uint32_t), 1, fp);
-    fwrite(&n_syn, sizeof(uint32_t), 1, fp);
-    fwrite(&n_neu, sizeof(uint32_t), 1, fp);
-
-    // d_synapses_ (856MB) — 分块传输避免 host 端 856MB 内存峰值
-    const size_t syn_total_bytes = (size_t)n_syn * sizeof(BioSynapse);
-    const size_t CHUNK = 1024 * 1024;  // 1MB 分块
-    std::vector<char> h_buf(CHUNK);
-    size_t copied = 0;
-    while (copied < syn_total_bytes) {
-        size_t this_chunk = (syn_total_bytes - copied < CHUNK) ? (syn_total_bytes - copied) : CHUNK;
-        cudaMemcpy(h_buf.data(), (const char*)buf.d_synapses + copied,
-                   this_chunk, cudaMemcpyDeviceToHost);
-        fwrite(h_buf.data(), 1, this_chunk, fp);
-        copied += this_chunk;
-    }
-
-    // d_neuron_byte_counts (56MB) — 一次性传输
-    const size_t bc_total_bytes = (size_t)n_neu * 256 * sizeof(int);
-    std::vector<int> h_bc((size_t)n_neu * 256);
-    cudaMemcpy(h_bc.data(), buf.d_neuron_byte_counts,
-               bc_total_bytes, cudaMemcpyDeviceToHost);
-    fwrite(h_bc.data(), sizeof(int), (size_t)n_neu * 256, fp);
-
-    // d_synapse_alpha (42.8MB) — PSW LTP 证据
-    const size_t alpha_total_bytes = (size_t)n_syn * sizeof(float);
-    std::vector<float> h_alpha((size_t)n_syn);
-    cudaMemcpy(h_alpha.data(), buf.d_synapse_alpha,
-               alpha_total_bytes, cudaMemcpyDeviceToHost);
-    fwrite(h_alpha.data(), sizeof(float), (size_t)n_syn, fp);
-
-    // d_synapse_beta (42.8MB) — PSW LTD 证据
-    std::vector<float> h_beta((size_t)n_syn);
-    cudaMemcpy(h_beta.data(), buf.d_synapse_beta,
-               alpha_total_bytes, cudaMemcpyDeviceToHost);
-    fwrite(h_beta.data(), sizeof(float), (size_t)n_syn, fp);
-
-    fclose(fp);
-
-    const size_t total_bytes = syn_total_bytes + bc_total_bytes + 2 * alpha_total_bytes + 20;
-    printf("[Checkpoint] step=%d 已保存 (v2 含 PSW): %s (%.1f MB)\n",
-           step, filepath,
-           (double)total_bytes / (1024.0 * 1024.0));
-    return 0;
 }
 
 void BioMechanismScheduler::step(int current_step) {
@@ -1059,11 +976,10 @@ void BioMechanismScheduler::launch_structural_plasticity(int step) {
 
 void BioMechanismScheduler::launch_developmental(int step) {
     // 仅打印发育阶段切换
-    static DevPhase last_phase = static_cast<DevPhase>(255);
     DevPhase cur = phase_table_.get_phase(step);
-    if (cur != last_phase) {
+    if (static_cast<int>(cur) != last_phase_) {
         print_phase_change(step, cur);
-        last_phase = cur;
+        last_phase_ = static_cast<int>(cur);
     }
 }
 

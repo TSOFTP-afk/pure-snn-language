@@ -325,4 +325,23 @@ const DelayQueueRuntimeStats& delay_queue_stats() {
     return g_delay_stats;
 }
 
+bool export_delay_queue_state(DelayQueueCheckpointState* state) {
+    if (!state) return false;
+    ensure_counter_buffer();
+    cudaError_t err = cudaMemcpy(state->ring_counter_history, d_ring_write_counter,
+                                 sizeof(state->ring_counter_history), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return false;
+    state->stats = g_delay_stats;
+    return true;
+}
+
+bool import_delay_queue_state(const DelayQueueCheckpointState& state) {
+    ensure_counter_buffer();
+    memcpy(h_ring_counter_history, state.ring_counter_history,
+           sizeof(h_ring_counter_history));
+    g_delay_stats = state.stats;
+    return cudaMemcpy(d_ring_write_counter, state.ring_counter_history,
+                      sizeof(state.ring_counter_history), cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
 } // namespace stage2e

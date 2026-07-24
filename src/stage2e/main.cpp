@@ -18,6 +18,7 @@
 #include "input_encoding.cuh"
 #include "modulatory_kernels.cuh"
 #include "synapse_kernels.cuh"
+#include "run_config.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -25,40 +26,12 @@
 #include <vector>
 #include <algorithm>
 #include <cstdarg>
+#include <csignal>
 
-// 解析命令行参数
-static int parse_steps(int argc, char** argv) {
-    int steps = SMOKE_TEST_STEPS_2E;  // 默认 10K
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
-            steps = atoi(argv[i + 1]);
-            ++i;
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: snn_stage2e_p1 [--steps N] [--csv PATH] [--e0] [--help]\n");
-            printf("  --steps N   运行 N 步 (默认 %d)\n", SMOKE_TEST_STEPS_2E);
-            printf("  --csv PATH  每步输出 spike 序列到 CSV (评估模式)\n");
-            printf("  --e0        E0 消融模式 (纯 STDP 基线, 关闭三因素+CaMKII+调质)\n");
-            printf("  --help      显示帮助\n");
-            exit(0);
-        }
-    }
-    return steps;
-}
+static volatile std::sig_atomic_t g_stop_requested = 0;
 
-static bool parse_e0_flag(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--e0") == 0) return true;
-    }
-    return false;
-}
-
-static const char* get_csv_path(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
-            return argv[i + 1];
-        }
-    }
-    return nullptr;
+static void handle_stop_signal(int) {
+    g_stop_requested = 1;
 }
 
 static void emit_run_param(FILE* fp, const char* prefix, const char* key, const char* fmt, ...) {
@@ -82,8 +55,7 @@ static void emit_final_metric(FILE* fp, const char* key, const char* fmt, ...) {
 }
 
 static void print_experiment_metadata(FILE* fp, const char* prefix,
-                                      int total_steps,
-                                      bool e0_mode,
+                                      const stage2e::RunConfig& config,
                                       bool csv_enabled,
                                       const char* csv_path,
                                       const cudaDeviceProp* prop) {
@@ -93,12 +65,20 @@ static void print_experiment_metadata(FILE* fp, const char* prefix,
     emit_run_param(fp, prefix, "build_date", "%s", __DATE__);
     emit_run_param(fp, prefix, "build_time", "%s", __TIME__);
     emit_run_param(fp, prefix, "design_doc", "docs/superpowers/specs/2026-07-19-bio-mechanisms-design.md");
-    emit_run_param(fp, prefix, "total_steps", "%d", total_steps);
-    emit_run_param(fp, prefix, "e0_mode", "%d", e0_mode ? 1 : 0);
+    emit_run_param(fp, prefix, "total_steps", "%d", config.total_steps);
+    emit_run_param(fp, prefix, "e0_mode", "%d", config.e0_mode ? 1 : 0);
+    emit_run_param(fp, prefix, "synthetic_input", "%d", config.synthetic_input ? 1 : 0);
+    emit_run_param(fp, prefix, "device", "%d", config.device);
+    emit_run_param(fp, prefix, "seed", "%u", config.seed);
+    emit_run_param(fp, prefix, "text_path", "%s", config.text_path.c_str());
+    emit_run_param(fp, prefix, "checkpoint_dir", "%s", config.checkpoint_dir.c_str());
+    emit_run_param(fp, prefix, "checkpoint_interval", "%d", config.checkpoint_interval);
+    emit_run_param(fp, prefix, "keep_checkpoints", "%d", config.keep_checkpoints);
+    emit_run_param(fp, prefix, "resume_path", "%s", config.resume_path.c_str());
     emit_run_param(fp, prefix, "csv_enabled", "%d", csv_enabled ? 1 : 0);
     emit_run_param(fp, prefix, "csv_path", "%s", csv_path ? csv_path : "");
     emit_run_param(fp, prefix, "log_interval", "%d", LOG_INTERVAL_2E);
-    emit_run_param(fp, prefix, "checkpoint_interval", "%d", CHECKPOINT_INTERVAL_2E);
+    emit_run_param(fp, prefix, "compiled_checkpoint_interval", "%d", CHECKPOINT_INTERVAL_2E);
     emit_run_param(fp, prefix, "smoke_test_steps", "%d", SMOKE_TEST_STEPS_2E);
     emit_run_param(fp, prefix, "gpu_name", "%s", prop ? prop->name : "unknown");
     emit_run_param(fp, prefix, "gpu_total_mem_mb", "%.0f", prop ? prop->totalGlobalMem / (1024.0 * 1024.0) : 0.0);
@@ -576,8 +556,20 @@ int main(int argc, char** argv) {
     // 禁用 stdout 缓冲, 让重定向到文件时也能实时输出 (每 30K 步检查需要)
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    std::signal(SIGINT, handle_stop_signal);
+    std::signal(SIGTERM, handle_stop_signal);
 
-    int total_steps = parse_steps(argc, argv);
+    stage2e::RunConfig config;
+    std::string config_error;
+    if (!stage2e::parse_run_config(argc, argv, &config, &config_error)) {
+        fprintf(stderr, "ERROR: %s\n%s", config_error.c_str(), stage2e::run_config_usage());
+        return 2;
+    }
+    if (config.show_help) {
+        printf("%s", stage2e::run_config_usage());
+        return 0;
+    }
+    const int total_steps = config.total_steps;
 
     printf("============================================================\n");
     printf("  THE TRUE AI - Stage 2e Phase 1\n");
@@ -596,20 +588,20 @@ int main(int argc, char** argv) {
     // --- 1. 选择 GPU 设备 ---
     int dev_count = 0;
     cudaGetDeviceCount(&dev_count);
-    if (dev_count == 0) {
+    if (dev_count == 0 || config.device >= dev_count) {
         fprintf(stderr, "[P1 FAIL] 未检测到 CUDA 设备\n");
         return 1;
     }
-    cudaSetDevice(0);
+    cudaSetDevice(config.device);
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    cudaGetDeviceProperties(&prop, config.device);
     printf("[P1] 使用 GPU: %s (%.0f MB 显存, compute capability %d.%d)\n\n",
            prop.name, prop.totalGlobalMem / (1024.0 * 1024.0),
            prop.major, prop.minor);
 
-    bool e0_mode = parse_e0_flag(argc, argv);
-    const char* csv_path = get_csv_path(argc, argv);
-    print_experiment_metadata(stdout, "", total_steps, e0_mode, csv_path != nullptr, csv_path, &prop);
+    bool e0_mode = config.e0_mode;
+    const char* csv_path = config.csv_path.empty() ? nullptr : config.csv_path.c_str();
+    print_experiment_metadata(stdout, "", config, csv_path != nullptr, csv_path, &prop);
     printf("\n");
 
     // --- 2. 显存分配 ---
@@ -628,24 +620,29 @@ int main(int argc, char** argv) {
 
     // --- 3. 网络初始化 (P1 新增) ---
     printf("\n");
-    stage2e::init_network(&allocator);
+    if (config.resume_path.empty()) {
+        stage2e::init_network(&allocator, config.seed);
+    } else {
+        printf("[P1] resume mode: skipping fresh topology initialization\n");
+    }
 
     // --- 3.5 加载真实文本语料 (LCCC 子集) ---
     // 替代 step%256 循环注入, 改为 UTF-8 字节流注入
     // 生物学意义: 让网络学习真实中文文本的字节级统计规律
     {
-        const char* lccc_path = "data/lccc_sample_1mb.txt";
-        // 尝试相对于工作目录的路径, 失败则尝试相对于 exe 的路径
-        size_t loaded = stage2e::load_text_corpus(lccc_path);
-        if (loaded == 0) {
-            // 回退: 尝试项目根目录的路径
-            loaded = stage2e::load_text_corpus("../data/lccc_sample_1mb.txt");
+        size_t loaded = 0;
+        if (!config.synthetic_input) {
+            loaded = stage2e::load_text_corpus(config.text_path.c_str());
         }
         if (loaded > 0) {
             printf("[P1] 已加载 LCCC 真实文本语料: %zu 字节\n", loaded);
             printf("[P1] 输入模式: 真实 UTF-8 字节流 (替代 step%%256 循环)\n\n");
+        } else if (config.synthetic_input) {
+            printf("[P1] 输入模式: 显式 synthetic 0..255 循环\n\n");
         } else {
-            printf("[P1 WARNING] LCCC 加载失败, 回退到 step%%256 循环模式\n\n");
+            fprintf(stderr, "[P1 FAIL] 无法加载语料: %s\n", config.text_path.c_str());
+            allocator.free_all();
+            return 1;
         }
     }
 
@@ -660,23 +657,52 @@ int main(int argc, char** argv) {
         printf("  *** E0 scheduler.e0_ablation = true ***\n\n");
     }
 
+    int start_step = 0;
+    if (!config.resume_path.empty()) {
+        const bool requested_e0 = config.e0_mode;
+        uint32_t checkpoint_seed = 0;
+        const int resume_rc = scheduler.load_checkpoint(
+            config.resume_path.c_str(), &start_step, &checkpoint_seed);
+        if (resume_rc != 0) {
+            fprintf(stderr, "[P1 FAIL] checkpoint resume failed (code=%d)\n", resume_rc);
+            allocator.free_all();
+            return 1;
+        }
+        if (scheduler.e0_ablation != requested_e0) {
+            fprintf(stderr, "[P1 FAIL] --e0 does not match checkpoint mode\n");
+            allocator.free_all();
+            return 1;
+        }
+        config.seed = checkpoint_seed;
+        emit_run_param(stdout, "", "resumed_topology_seed", "%u", config.seed);
+        emit_run_param(stdout, "", "resumed_next_step", "%d", start_step);
+        if (start_step >= total_steps) {
+            fprintf(stderr, "[P1 FAIL] --steps (%d) must exceed resumed next_step (%d)\n",
+                    total_steps, start_step);
+            allocator.free_all();
+            return 1;
+        }
+    }
+
     // --- 5. 主循环 ---
     FILE* csv_fp = nullptr;
     if (csv_path) {
-        csv_fp = fopen(csv_path, "w");
+        csv_fp = fopen(csv_path, start_step > 0 ? "a" : "w");
         if (!csv_fp) {
             fprintf(stderr, "[P1] 无法打开 CSV 输出: %s\n", csv_path);
         } else {
-            print_experiment_metadata(csv_fp, "# ", total_steps, e0_mode, true, csv_path, &prop);
-            fprintf(csv_fp, "step,spikes,is_inject_step,byte,nmda_sum,nmda_nz,"
+            if (start_step == 0) {
+                print_experiment_metadata(csv_fp, "# ", config, true, csv_path, &prop);
+                fprintf(csv_fp, "step,spikes,is_inject_step,byte,nmda_sum,nmda_nz,"
                             "xpre_sum,xpre_nz,ca_sum,ca_nz,weight_mean,weight_abs_mean,"
                             "weight_min,weight_max,arrived_events,dispatched_events,dropped_events,max_slot_depth\n");
+            }
         }
     }
 
     printf("\n[P1] 开始 %d 步快时间尺度测试...\n\n", total_steps);
 
-    for (int step = 0; step < total_steps; ++step) {
+    for (int step = start_step; step < total_steps; ++step) {
         scheduler.step(step);
 
         // CSV 采样: 每步记录 (开销主要在 device→host 拷贝)
@@ -736,10 +762,48 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Checkpoint: 每 CHECKPOINT_INTERVAL_2E 步保存 (防止长测崩溃丢失进度)
-        if (step > 0 && step % CHECKPOINT_INTERVAL_2E == 0) {
-            scheduler.save_checkpoint(step);
+        const int next_step = step + 1;
+        if (g_stop_requested) {
+            if (config.checkpoint_interval == 0) {
+                fprintf(stderr, "\n[P1] stop requested; checkpointing is disabled\n");
+                if (csv_fp) fclose(csv_fp);
+                return 130;
+            }
+            fprintf(stderr, "\n[P1] stop requested; saving checkpoint at next_step=%d\n", next_step);
+            const int checkpoint_rc = scheduler.save_checkpoint(
+                next_step, config.checkpoint_dir.c_str(), config.seed);
+            if (checkpoint_rc == 0) {
+                scheduler.prune_checkpoints(config.checkpoint_dir.c_str(), config.keep_checkpoints);
+            }
+            if (csv_fp) fclose(csv_fp);
+            return checkpoint_rc == 0 ? 130 : 1;
         }
+
+        if (config.checkpoint_interval > 0 && next_step % config.checkpoint_interval == 0) {
+            const int checkpoint_rc = scheduler.save_checkpoint(
+                next_step, config.checkpoint_dir.c_str(), config.seed);
+            if (checkpoint_rc != 0) {
+                fprintf(stderr, "[P1 FAIL] checkpoint failed (code=%d)\n", checkpoint_rc);
+                if (csv_fp) fclose(csv_fp);
+                allocator.free_all();
+                return 1;
+            }
+            scheduler.prune_checkpoints(config.checkpoint_dir.c_str(), config.keep_checkpoints);
+        }
+    }
+
+    if (config.checkpoint_interval > 0 &&
+        total_steps >= config.checkpoint_interval &&
+        total_steps % config.checkpoint_interval != 0) {
+        const int checkpoint_rc = scheduler.save_checkpoint(
+            total_steps, config.checkpoint_dir.c_str(), config.seed);
+        if (checkpoint_rc != 0) {
+            fprintf(stderr, "[P1 FAIL] final checkpoint failed (code=%d)\n", checkpoint_rc);
+            if (csv_fp) fclose(csv_fp);
+            allocator.free_all();
+            return 1;
+        }
+        scheduler.prune_checkpoints(config.checkpoint_dir.c_str(), config.keep_checkpoints);
     }
 
     if (csv_fp) {

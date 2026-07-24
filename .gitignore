@@ -47,6 +47,8 @@ data/lccc_base_split.zip
 # 工具链副本（CUDA Toolkit / MSVC / Windows SDK 本地副本，1.3GB，不归档）
 # 用户应自行安装 CUDA Toolkit 13.x 和 Visual Studio 2022 Build Tools
 tools/
+!src/stage2e/tools/
+!src/stage2e/tools/inspect_checkpoint.py
 
 # 调试期间临时测试文件
 test_*.cu

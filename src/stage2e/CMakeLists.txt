@@ -25,11 +25,10 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# UTF-8 源编码 (MSVC 中文 locale 否则会误解析 UTF-8)
-add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
-add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
-
 if(MSVC)
+    # UTF-8 源编码 (MSVC 中文 locale 否则会误解析 UTF-8)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>)
     # 关闭 MSVC 对未使用参数的警告 (P1 占位 kernel 必然有未用参数)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4100>)
@@ -39,6 +38,7 @@ if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4018>)
 else()
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wno-unused-parameter>)
 endif()
 
 set(CMAKE_CUDA_STANDARD 17)
@@ -58,6 +58,8 @@ set(STAGE2E_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/modulatory_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/thalamic_gate.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/run_config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scheduler_checkpoint.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
 )
 
@@ -84,4 +86,14 @@ target_compile_options(snn_stage2e_p1 PRIVATE
 # 本地运行用 sm_86, DGX Spark 运行用 sm_120
 set_target_properties(snn_stage2e_p1 PROPERTIES
     CUDA_ARCHITECTURES "86;120"
+    CUDA_SEPARABLE_COMPILATION ON
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(stage2e_run_config_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/run_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_config_test.cpp)
+    target_include_directories(stage2e_run_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME stage2e_run_config_test COMMAND stage2e_run_config_test)
+endif()

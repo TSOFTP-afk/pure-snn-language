@@ -107,7 +107,7 @@ struct PersistentBuffers {
 // -----------------------------------------------------------------------------
 class MemoryAllocator {
 public:
-    MemoryAllocator() : d_bufs_{}, vram_peak_(0), vram_used_(0) {}
+    MemoryAllocator() : d_bufs_{}, vram_peak_(0), vram_used_(0), allocation_failed_(false) {}
     ~MemoryAllocator() { free_all(); }
 
     // 分配所有持久缓冲 (返回总字节数, 失败返回 0)
@@ -134,6 +134,7 @@ private:
     PersistentBuffers d_bufs_;
     size_t vram_used_;
     size_t vram_peak_;
+    bool allocation_failed_;
 
     // 模板化分配助手
     template<typename T>

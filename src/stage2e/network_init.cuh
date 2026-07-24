@@ -33,13 +33,14 @@ int  init_synapses(BioSynapse* d_synapses,
                    uint8_t* d_synapse_delay,
                    float* d_synapse_alpha,    // PSW: LTP 证据累积
                    float* d_synapse_beta,     // PSW: LTD 证据累积
-                   const NeuronStateAdEx* d_neurons);
+                   const NeuronStateAdEx* d_neurons,
+                   uint32_t seed = 42);
 
 // 初始化 GPU 缓冲为零 (调质浓度, 输入电流, nmda_current, etc.)
 void init_buffers_zero(MemoryAllocator* alloc);
 
 // P1 完整初始化入口 (调用上述三个)
-void init_network(MemoryAllocator* alloc);
+void init_network(MemoryAllocator* alloc, uint32_t seed = 42);
 
 } // namespace stage2e
 
