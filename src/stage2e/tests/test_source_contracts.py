@@ -41,6 +41,17 @@ class SourceContracts(unittest.TestCase):
         self.assertIn('cd "$PROJECT_ROOT"', script)
         self.assertIn("data/lccc_sample_1mb.txt", script)
 
+    def test_linux_warning_flags_are_a_quoted_cmake_list(self):
+        cmake = (STAGE2E / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn(
+            '"$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wno-unused-parameter>"',
+            cmake,
+        )
+        self.assertNotIn(
+            "$<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>",
+            cmake,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

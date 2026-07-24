@@ -37,8 +37,12 @@ if(MSVC)
     # 关闭无符号/有符号比较警告
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4018>)
 else()
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>)
-    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wno-unused-parameter>)
+    # Quote list-valued generator expressions so CMake does not split them into
+    # malformed literal arguments such as "$<1:-Wall" on Linux generators.
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wno-unused-parameter>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wno-unused-parameter>"
+    )
 endif()
 
 set(CMAKE_CUDA_STANDARD 17)
