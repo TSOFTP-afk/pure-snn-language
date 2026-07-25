@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.trainers import BpeTrainer
@@ -118,6 +119,7 @@ def build_tokenizer(corpus: Path, output: Path, vocab_size: int) -> Tokenizer:
         show_progress=True,
     )
     tokenizer.train([str(corpus)], trainer)
+    tokenizer.decoder = ByteLevelDecoder()
     tokenizer.save(str(output))
     return tokenizer
 
@@ -131,11 +133,91 @@ def load_tokens(corpus: Path, tokenizer: Tokenizer) -> torch.Tensor:
 
 
 def sample_batch(tokens: torch.Tensor, batch: int, seq_len: int,
-                 device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    starts = torch.randint(0, tokens.numel() - seq_len - 1, (batch,))
+                 device: torch.device,
+                 generator: torch.Generator | None = None
+                 ) -> tuple[torch.Tensor, torch.Tensor]:
+    starts = torch.randint(
+        0, tokens.numel() - seq_len - 1, (batch,), generator=generator
+    )
     offsets = torch.arange(seq_len + 1)
     window = tokens[starts[:, None] + offsets[None, :]].to(device, non_blocking=True)
     return window[:, :-1], window[:, 1:]
+
+
+def split_tokens(tokens: torch.Tensor, seq_len: int,
+                 val_fraction: float) -> tuple[torch.Tensor, torch.Tensor]:
+    min_partition = seq_len + 2
+    val_count = max(min_partition, int(tokens.numel() * val_fraction))
+    if tokens.numel() - val_count < min_partition:
+        raise RuntimeError(
+            f"corpus has {tokens.numel()} tokens, too few for seq_len={seq_len} "
+            f"and val_fraction={val_fraction}"
+        )
+    return tokens[:-val_count], tokens[-val_count:]
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, tokens: torch.Tensor, batch: int, seq_len: int,
+             batches: int, device: torch.device, seed: int
+             ) -> tuple[float, float]:
+    was_training = model.training
+    model.eval()
+    generator = torch.Generator().manual_seed(seed)
+    loss_sum = 0.0
+    spike_sum = 0.0
+    for _ in range(batches):
+        x, y = sample_batch(tokens, batch, seq_len, device, generator)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            logits, spike_rate = model(x)
+            loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
+        loss_sum += loss.item()
+        spike_sum += spike_rate.item()
+    model.train(was_training)
+    return loss_sum / batches, spike_sum / batches
+
+
+@torch.no_grad()
+def generate_sample(model: nn.Module, tokenizer: Tokenizer, prompt: str,
+                    sample_tokens: int, seq_len: int, device: torch.device,
+                    temperature: float, top_k: int, seed: int) -> str:
+    ids = tokenizer.encode(prompt).ids
+    if not ids:
+        ids = [tokenizer.token_to_id("<bos>") or 0]
+    generator = torch.Generator(device=device).manual_seed(seed)
+    was_training = model.training
+    model.eval()
+    for _ in range(sample_tokens):
+        context = ids[-seq_len:]
+        x = torch.tensor(context, dtype=torch.long, device=device)[None, :]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            logits, _ = model(x)
+        next_logits = logits[0, -1].float() / temperature
+        k = min(top_k, next_logits.numel())
+        values, indices = torch.topk(next_logits, k)
+        probabilities = F.softmax(values, dim=-1)
+        selected = torch.multinomial(probabilities, 1, generator=generator)
+        ids.append(indices[selected].item())
+    model.train(was_training)
+    return tokenizer.decode(ids)
+
+
+def save_checkpoint(output: Path, step_id: int, model: nn.Module,
+                    optimizer: torch.optim.Optimizer, args: argparse.Namespace,
+                    tokens_seen: int, vocab: int) -> None:
+    tmp = output / f"checkpoint_{step_id}.pt.tmp"
+    final = output / f"checkpoint_{step_id}.pt"
+    torch.save(
+        {
+            "step": step_id,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": vars(args),
+            "tokens_seen": tokens_seen,
+            "vocab": vocab,
+        },
+        tmp,
+    )
+    os.replace(tmp, final)
 
 
 def parse_args() -> argparse.Namespace:
@@ -156,9 +238,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--checkpoint-interval", type=int, default=250)
+    p.add_argument("--eval-interval", type=int, default=100)
+    p.add_argument("--eval-batches", type=int, default=8)
+    p.add_argument("--val-fraction", type=float, default=0.02)
+    p.add_argument("--sample-tokens", type=int, default=32)
+    p.add_argument("--prompt", default="我")
+    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--top-k", type=int, default=20)
+    p.add_argument("--resume")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--compile", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    if not 0.0 < args.val_fraction < 0.5:
+        p.error("--val-fraction must be between 0 and 0.5")
+    if args.eval_batches < 1:
+        p.error("--eval-batches must be at least 1")
+    if args.temperature <= 0.0:
+        p.error("--temperature must be positive")
+    if args.top_k < 1:
+        p.error("--top-k must be at least 1")
+    return args
 
 
 def main() -> None:
@@ -174,30 +273,62 @@ def main() -> None:
     tokenizer_path = Path(args.tokenizer)
     tokenizer = (Tokenizer.from_file(str(tokenizer_path)) if tokenizer_path.exists()
                  else build_tokenizer(corpus, tokenizer_path, args.vocab_size))
-    tokens = load_tokens(corpus, tokenizer).pin_memory()
+    if tokenizer.decoder is None:
+        tokenizer.decoder = ByteLevelDecoder()
+    tokens = load_tokens(corpus, tokenizer)
+    train_tokens, val_tokens = split_tokens(tokens, args.seq_len, args.val_fraction)
+    train_tokens = train_tokens.pin_memory()
+    val_tokens = val_tokens.pin_memory()
     vocab = tokenizer.get_vocab_size()
-    model = SparkSNNLM(vocab, args.seq_len, args.d_model, args.d_ff,
-                       args.layers, args.dropout).to(device=device, dtype=torch.bfloat16)
+    raw_model = SparkSNNLM(vocab, args.seq_len, args.d_model, args.d_ff,
+                           args.layers, args.dropout).to(
+                               device=device, dtype=torch.bfloat16
+                           )
+    checkpoint = None
+    start_step = 0
+    tokens_seen = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        if checkpoint.get("vocab", vocab) != vocab:
+            raise RuntimeError(
+                f"checkpoint vocab={checkpoint.get('vocab')} does not match "
+                f"tokenizer vocab={vocab}"
+            )
+        raw_model.load_state_dict(checkpoint["model"])
+        start_step = int(checkpoint["step"])
+        tokens_seen = int(checkpoint.get("tokens_seen", 0))
+        if start_step >= args.steps:
+            raise RuntimeError(
+                f"checkpoint step {start_step} already reached --steps {args.steps}"
+            )
+    model: nn.Module = raw_model
     if args.compile:
         model = torch.compile(model, mode="max-autotune")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay, fused=True)
-    params = sum(p.numel() for p in model.parameters())
+    if checkpoint is not None:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    params = sum(p.numel() for p in raw_model.parameters())
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
-    print(f"RUN model=SparkSNNLM params={params} vocab={vocab} tokens={tokens.numel()}", flush=True)
+    print(
+        f"RUN model=SparkSNNLM params={params} vocab={vocab} "
+        f"train_tokens={train_tokens.numel()} val_tokens={val_tokens.numel()} "
+        f"start_step={start_step}",
+        flush=True,
+    )
     print(f"RUN device={torch.cuda.get_device_name(0)} dtype=bf16", flush=True)
 
     model.train()
     started = time.perf_counter()
-    tokens_seen = 0
+    session_tokens = 0
     optimizer.zero_grad(set_to_none=True)
-    for step_id in range(1, args.steps + 1):
+    for step_id in range(start_step + 1, args.steps + 1):
         loss_sum = 0.0
         spike_sum = 0.0
         for _ in range(args.grad_accum):
-            x, y = sample_batch(tokens, args.batch_size, args.seq_len, device)
+            x, y = sample_batch(train_tokens, args.batch_size, args.seq_len, device)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits, spike_rate = model(x)
                 loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
@@ -206,27 +337,53 @@ def main() -> None:
             loss_sum += loss.detach().item()
             spike_sum += spike_rate.detach().item()
             tokens_seen += x.numel()
+            session_tokens += x.numel()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        if step_id == 1 or step_id % args.log_interval == 0:
+        if step_id == start_step + 1 or step_id % args.log_interval == 0:
             elapsed = time.perf_counter() - started
             avg_loss = loss_sum / args.grad_accum
             allocated = torch.cuda.memory_allocated() / 2**30
             reserved = torch.cuda.memory_reserved() / 2**30
             print(
                 f"TRAIN step={step_id} loss={avg_loss:.5f} ppl={math.exp(min(avg_loss, 20)):.2f} "
-                f"spike_rate={spike_sum / args.grad_accum:.4f} tok_s={tokens_seen / elapsed:.1f} "
+                f"spike_rate={spike_sum / args.grad_accum:.4f} "
+                f"tok_s={session_tokens / elapsed:.1f} "
                 f"mem_alloc_gib={allocated:.2f} mem_reserved_gib={reserved:.2f}",
                 flush=True,
             )
+        if args.eval_interval and step_id % args.eval_interval == 0:
+            val_loss, val_spike = evaluate(
+                model, val_tokens, args.batch_size, args.seq_len,
+                args.eval_batches, device, args.seed + step_id
+            )
+            print(
+                f"EVAL step={step_id} loss={val_loss:.5f} "
+                f"ppl={math.exp(min(val_loss, 20)):.2f} "
+                f"spike_rate={val_spike:.4f}",
+                flush=True,
+            )
+            if args.sample_tokens:
+                sample = generate_sample(
+                    model, tokenizer, args.prompt, args.sample_tokens,
+                    args.seq_len, device, args.temperature, args.top_k,
+                    args.seed + step_id
+                )
+                print(
+                    f"SAMPLE step={step_id} text={json.dumps(sample, ensure_ascii=False)}",
+                    flush=True,
+                )
         if args.checkpoint_interval and step_id % args.checkpoint_interval == 0:
-            tmp = out / f"checkpoint_{step_id}.pt.tmp"
-            final = out / f"checkpoint_{step_id}.pt"
-            torch.save({"step": step_id, "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(), "args": vars(args)}, tmp)
-            os.replace(tmp, final)
+            save_checkpoint(
+                out, step_id, raw_model, optimizer, args, tokens_seen, vocab
+            )
+
+    if args.checkpoint_interval and args.steps % args.checkpoint_interval:
+        save_checkpoint(
+            out, args.steps, raw_model, optimizer, args, tokens_seen, vocab
+        )
 
 
 if __name__ == "__main__":

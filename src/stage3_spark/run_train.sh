@@ -8,6 +8,8 @@ cd "$ROOT"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run --rm --name "$NAME" --gpus all \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp/stage3-home \
   --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
   -v "$ROOT:/workspace/pure-snn-language" \
   -w /workspace/pure-snn-language \

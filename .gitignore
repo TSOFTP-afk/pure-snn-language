@@ -82,6 +82,8 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+src/stage3_spark/runs/
+src/stage3_spark/tokenizer*.json
 
 # 临时文件
 COMMIT_MSG.txt
