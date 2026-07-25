@@ -100,4 +100,20 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_config_test.cpp)
     target_include_directories(stage2e_run_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME stage2e_run_config_test COMMAND stage2e_run_config_test)
+
+    # 离线工具: inspect_ckpt (host-only, 不依赖 CUDA, 可直接用 C++ 编译器)
+    add_executable(inspect_ckpt
+        ${CMAKE_CURRENT_SOURCE_DIR}/inspect_ckpt.cpp)
+    target_include_directories(inspect_ckpt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # 离线工具: decoder (host-only, 不依赖 CUDA runtime, 但包含 config.h/types.h)
+    # 注: decoder.cu 中已不再依赖 BioSynapse (改用 v3 section 读取), 故可用 C++ 编译
+    add_executable(snn_stage2e_decoder
+        ${CMAKE_CURRENT_SOURCE_DIR}/decoder.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/decoder_main.cpp)
+    target_include_directories(snn_stage2e_decoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    # decoder.cu 用 .cu 扩展名但实际是 host 代码, 关闭 CUDA 编译以加速
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/decoder.cu
+        PROPERTIES LANGUAGE CXX)
 endif()
