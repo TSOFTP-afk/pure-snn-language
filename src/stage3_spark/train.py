@@ -9,6 +9,8 @@ integrators so the hot path maps to Blackwell tensor operations.
 from __future__ import annotations
 
 import argparse
+from array import array
+import hashlib
 import json
 import math
 import os
@@ -133,13 +135,25 @@ def load_tokens(corpus: Path, tokenizer: Tokenizer, tokenizer_path: Path,
         "corpus_mtime_ns": corpus_stat.st_mtime_ns,
         "tokenizer_path": str(tokenizer_path.resolve()),
         "tokenizer_size": tokenizer_path.stat().st_size,
+        "tokenizer_sha256": hashlib.sha256(tokenizer_path.read_bytes()).hexdigest(),
         "vocab": tokenizer.get_vocab_size(),
     }
-    if cache_path and cache_path.exists():
-        cached = torch.load(cache_path, map_location="cpu", weights_only=True)
-        if cached.get("metadata") == metadata:
-            tokens = cached.get("tokens")
-            if isinstance(tokens, torch.Tensor) and tokens.dtype == torch.int32:
+    metadata_path = (
+        cache_path.with_suffix(cache_path.suffix + ".json")
+        if cache_path else None
+    )
+    if cache_path and metadata_path and cache_path.exists() and metadata_path.exists():
+        cached_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        token_count = int(cached_metadata.pop("token_count", 0))
+        if (
+            cached_metadata == metadata
+            and token_count >= 1024
+            and cache_path.stat().st_size == token_count * 4
+        ):
+            tokens = torch.from_file(
+                str(cache_path), shared=False, size=token_count, dtype=torch.int32
+            )
+            if tokens.numel() == token_count:
                 print(
                     f"RUN token_cache=hit path={cache_path} "
                     f"tokens={tokens.numel()}",
@@ -148,22 +162,58 @@ def load_tokens(corpus: Path, tokenizer: Tokenizer, tokenizer_path: Path,
                 return tokens
         print(f"RUN token_cache=stale path={cache_path}", flush=True)
 
-    text = corpus.read_text(encoding="utf-8", errors="replace")
-    ids = tokenizer.encode(text).ids
-    if len(ids) < 1024:
-        raise RuntimeError("corpus is too small after tokenization")
-    tokens = torch.tensor(ids, dtype=torch.int32)
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        torch.save({"metadata": metadata, "tokens": tokens}, temporary)
-        os.replace(temporary, cache_path)
+        temporary_data = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        temporary_metadata = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+        token_count = 0
+        encoded_characters = 0
+        try:
+            with corpus.open(
+                "r", encoding="utf-8", errors="replace"
+            ) as source, temporary_data.open("wb") as destination:
+                while chunk := source.read(4 * 1024 * 1024):
+                    ids = tokenizer.encode(chunk).ids
+                    array("i", ids).tofile(destination)
+                    token_count += len(ids)
+                    encoded_characters += len(chunk)
+                    if encoded_characters // (256 * 1024 * 1024) != (
+                        encoded_characters - len(chunk)
+                    ) // (256 * 1024 * 1024):
+                        print(
+                            f"RUN token_cache=building "
+                            f"characters={encoded_characters} "
+                            f"tokens={token_count}",
+                            flush=True,
+                        )
+            if token_count < 1024:
+                raise RuntimeError("corpus is too small after tokenization")
+            os.replace(temporary_data, cache_path)
+            final_metadata = dict(metadata)
+            final_metadata["token_count"] = token_count
+            temporary_metadata.write_text(
+                json.dumps(final_metadata, indent=2), encoding="utf-8"
+            )
+            os.replace(temporary_metadata, metadata_path)
+        except BaseException:
+            temporary_data.unlink(missing_ok=True)
+            temporary_metadata.unlink(missing_ok=True)
+            raise
+        tokens = torch.from_file(
+            str(cache_path), shared=False, size=token_count, dtype=torch.int32
+        )
         print(
             f"RUN token_cache=created path={cache_path} "
             f"tokens={tokens.numel()}",
             flush=True,
         )
-    return tokens
+        return tokens
+
+    text = corpus.read_text(encoding="utf-8", errors="replace")
+    ids = tokenizer.encode(text).ids
+    if len(ids) < 1024:
+        raise RuntimeError("corpus is too small after tokenization")
+    return torch.tensor(ids, dtype=torch.int32)
 
 
 def sample_batch(tokens: torch.Tensor, batch: int, seq_len: int,
