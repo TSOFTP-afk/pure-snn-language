@@ -52,8 +52,9 @@ void launch_lif_adex(MemoryAllocator* alloc, int step, const struct DevPhasePara
                      int* d_single_neuron_burst_counter);
 
 // 按突触 delay_steps 把 pre 脉冲分发到环形队列
-// 内部: 清零计数器, 启动 delay_dispatch_kernel, 同步, 拷贝计数器回 host
+// launch 只入队 GPU 工作；finish 与本步其他统计共用一次 host 同步。
 void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx);
+void finish_delay_dispatch();
 
 int delay_queue_last_arrived_events();
 const DelayQueueRuntimeStats& delay_queue_stats();

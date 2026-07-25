@@ -72,6 +72,7 @@ struct PersistentBuffers {
     // 输入电流缓冲
     float*             d_input_current;          // 55,000 × 4B
     float*             d_nmda_current;           // 55,000 × 4B
+    float2*            d_nmda_post_state;        // 55,000 × (V_norm, Mg factor)
     float*             d_inhibitory_current;     // 55,000 × 4B
 
     // 调质浓度 (4 种 × 55K × 4B = 0.88 MB)

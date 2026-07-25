@@ -266,7 +266,7 @@ void launch_delay_inject(MemoryAllocator* alloc, int ring_idx) {
 // scheduler 在 lif_adex 之后调用:
 //   1. 清零 d_ring_write_counter
 //   2. 启动 delay_dispatch_kernel (写入 target_ring = (ring_idx + delay) % MAX)
-//   3. 同步并拷贝 d_ring_write_counter 到 h_ring_counter_history
+//   3. scheduler 在其他本步 kernel 入队后调用 finish_delay_dispatch()
 void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx) {
     ensure_counter_buffer();
     PersistentBuffers& b = alloc->buffers();
@@ -285,9 +285,13 @@ void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx) {
         d_dispatch_counts,
         N_TOTAL_NEURONS_2E,
         ring_idx);
+}
 
-    // A blocking copy already synchronizes the default stream. Copy the
-    // contiguous ring + dispatch counters in one operation.
+void finish_delay_dispatch() {
+    ensure_counter_buffer();
+
+    // This blocking copy is intentionally deferred until all per-step kernels
+    // have been enqueued, so delay and spike statistics share one GPU sync.
     int h_delay_counters[DELAY_STEPS_MAX + 2]{};
     cudaMemcpy(h_delay_counters, d_delay_counters,
                sizeof(h_delay_counters), cudaMemcpyDeviceToHost);

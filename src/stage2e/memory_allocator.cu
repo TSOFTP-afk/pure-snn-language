@@ -83,6 +83,7 @@ size_t MemoryAllocator::allocate_all() {
     // --- 输入电流 ---
     d_bufs_.d_input_current     = alloc<float>(N_TOTAL_NEURONS_2E, "d_input_current", &total);
     d_bufs_.d_nmda_current      = alloc<float>(N_TOTAL_NEURONS_2E, "d_nmda_current", &total);
+    d_bufs_.d_nmda_post_state   = alloc<float2>(N_TOTAL_NEURONS_2E, "d_nmda_post_state", &total);
     d_bufs_.d_inhibitory_current = alloc<float>(N_TOTAL_NEURONS_2E, "d_inhibitory_current", &total);
 
     // --- 调质浓度 ---
@@ -162,6 +163,7 @@ void MemoryAllocator::free_all() {
     FREE_PTR(d_bufs_.d_camkii_activity);
     FREE_PTR(d_bufs_.d_input_current);
     FREE_PTR(d_bufs_.d_nmda_current);
+    FREE_PTR(d_bufs_.d_nmda_post_state);
     FREE_PTR(d_bufs_.d_inhibitory_current);
     FREE_PTR(d_bufs_.d_da_concentration);
     FREE_PTR(d_bufs_.d_ach_concentration);

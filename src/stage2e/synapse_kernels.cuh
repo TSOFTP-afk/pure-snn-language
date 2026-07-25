@@ -78,6 +78,9 @@ void launch_camkii(MemoryAllocator* alloc, int step);
 // e2(t) = λ2·e2(t-1) + e1(t)          慢 τ~200ms
 void launch_stdp_eligibility(MemoryAllocator* alloc, int step);
 
+// CaMKII 与 eligibility 都是逐突触、无跨突触依赖；合并扫描以减少显存流量。
+void launch_camkii_eligibility(MemoryAllocator* alloc, int step);
+
 // 局部突触缩放 (§3.3, 每100步)
 // scale_local(i) = (target_fr / mean_FR(i))^α
 // w_ij *= scale_i · clamp(scale_j / scale_i, 0.5, 2.0)

@@ -55,9 +55,24 @@ __device__ __forceinline__ void materialize_trace_pair(
 // =============================================================================
 // synapse_nmda_kernel: NMDA 受体电压依赖 + 钙浓度更新
 // =============================================================================
+__global__ void nmda_post_state_kernel(
+    const NeuronStateAdEx* __restrict__ neurons,
+    float2* __restrict__ post_state,
+    int n_neurons)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_neurons) return;
+
+    float V_norm = neurons[i].membrane_potential;
+    float V_bio = V_BIO_OFFSET + V_BIO_SCALE * V_norm;
+    float mg_factor = 1.0f / (1.0f + NMDA_MG_CONCENTRATION *
+                               expf(-V_bio / 16.13f) / 3.57f);
+    post_state[i] = make_float2(V_norm, mg_factor);
+}
+
 __global__ void synapse_nmda_kernel(
     BioSynapse* __restrict__ synapses,
-    const NeuronStateAdEx* __restrict__ neurons,
+    const float2* __restrict__ post_state,
     float* __restrict__ nmda_current,         // 累积到 post 神经元的 NMDA 电流
     float* __restrict__ ca_snapshot,          // 当前步钙快照 (覆盖写入)
     int n_synapses,
@@ -69,15 +84,10 @@ __global__ void synapse_nmda_kernel(
     BioSynapse& s = synapses[i];
     int post = s.post_idx;
 
-    // 读取突触后神经元电压
-    float V_norm = neurons[post].membrane_potential;
-    // 电压重映射: V_bio = -70 + 50 * V_norm
-    float V_bio = V_BIO_OFFSET + V_BIO_SCALE * V_norm;
-
-    // Mg²⁺ 阻塞因子 (Jahr & Stevens 1990)
-    // g_NMDA(V) = 1 / (1 + [Mg²⁺] * exp(-V_bio/16.13) / 3.57)
-    float mg_factor = 1.0f / (1.0f + NMDA_MG_CONCENTRATION *
-                               expf(-V_bio / 16.13f) / 3.57f);
+    // 电压和 Mg²⁺ 阻塞因子只依赖突触后神经元；按神经元计算一次并供其突触复用。
+    float2 cached_post_state = post_state[post];
+    float V_norm = cached_post_state.x;
+    float mg_factor = cached_post_state.y;
     // 当 V_bio < -60mV: mg_factor 接近 0 (NMDA 闭合)
     // 当 V_bio > -20mV: mg_factor 接近 1 (NMDA 开放)
 
@@ -425,10 +435,16 @@ void launch_synapse_nmda(MemoryAllocator* alloc, int step, int arrived_ring_idx,
             arrived_count);
     }
 
+    int neuron_blocks = (N_TOTAL_NEURONS_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    nmda_post_state_kernel<<<neuron_blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_neurons,
+        b.d_nmda_post_state,
+        N_TOTAL_NEURONS_2E);
+
     int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     synapse_nmda_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         b.d_synapses,
-        b.d_neurons,
+        b.d_nmda_post_state,
         b.d_nmda_current,
         b.d_ca_snapshot,
         N_TOTAL_SYNAPSES_2E,
@@ -606,6 +622,57 @@ void launch_stdp_eligibility(MemoryAllocator* alloc, int step) {
     int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     stdp_eligibility_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         b.d_synapses, b.d_eligibility, b.d_eligibility_slow, N_TOTAL_SYNAPSES_2E);
+}
+
+__global__ void camkii_eligibility_kernel(
+    BioSynapse* __restrict__ synapses,
+    float* __restrict__ camkii_activity,
+    float* __restrict__ eligibility,
+    float* __restrict__ eligibility_slow,
+    int n_synapses)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_synapses) return;
+
+    BioSynapse& s = synapses[i];
+
+    // CaMKII update (identical to camkii_kernel).
+    float ca = s.ca_concentration;
+    float act = camkii_activity[i];
+    float autophosph = s.camkii_autophosph;
+    float ca4 = ca * ca * ca * ca;
+    float d_act = CAMKII_K1 * ca4 * (1.0f - act) - CAMKII_K2 * act * 0.5f;
+    float d_auto = CAMKII_K3 * act * act * (1.0f - autophosph)
+                 - CAMKII_K4 * autophosph * 0.5f;
+    act += d_act * 10.0f;
+    autophosph += d_auto * 10.0f;
+    if (act < 0.0f) act = 0.0f;
+    if (act > 1.0f) act = 1.0f;
+    if (autophosph < 0.0f) autophosph = 0.0f;
+    if (autophosph > 1.0f) autophosph = 1.0f;
+    camkii_activity[i] = act;
+    s.camkii_autophosph = autophosph;
+
+    // Eligibility update (identical to stdp_eligibility_kernel).
+    float e1_decay = expf(-10.0f / STDP_E1_TAU);
+    float e2_decay = expf(-10.0f / STDP_E2_TAU);
+    float e1 = eligibility[i] * e1_decay + s.eligibility;
+    float e2 = eligibility_slow[i] * e2_decay + e1;
+    s.eligibility = 0.0f;
+    eligibility[i] = e1;
+    eligibility_slow[i] = e2;
+}
+
+void launch_camkii_eligibility(MemoryAllocator* alloc, int step) {
+    (void)step;
+    PersistentBuffers& b = alloc->buffers();
+    int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    camkii_eligibility_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_synapses,
+        b.d_camkii_activity,
+        b.d_eligibility,
+        b.d_eligibility_slow,
+        N_TOTAL_SYNAPSES_2E);
 }
 
 // =============================================================================

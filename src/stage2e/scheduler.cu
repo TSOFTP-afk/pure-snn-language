@@ -482,8 +482,7 @@ void BioMechanismScheduler::step(int current_step) {
     // E0 消融模式: 跳过 CaMKII 和 eligibility (保留 inhibitory 占位)
     if (current_step % 10 == 0) {
         if (!e0_ablation) {
-            launch_camkii_kernel(current_step);
-            launch_stdp_eligibility(current_step);
+            launch_camkii_eligibility(alloc_, current_step);
         }
         launch_inhibitory_network(current_step);
     }
@@ -544,6 +543,8 @@ void BioMechanismScheduler::step(int current_step) {
     // 统计当前步 spike 数 (用于 P1 判据)
     count_spikes_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         buf.d_spike_flags, N_TOTAL_NEURONS_2E, d_spike_counter_);
+
+    finish_delay_dispatch();
 
     int h_step_counts[2] = {0, 0};
     cudaMemcpy(h_step_counts, d_spike_counter_, sizeof(h_step_counts), cudaMemcpyDeviceToHost);
