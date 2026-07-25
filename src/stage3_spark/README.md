@@ -41,6 +41,7 @@ src/stage3_spark/run_train.sh --steps 10000 --d-model 1536 --d-ff 4096 \
   --layers 12 --batch-size 8 --seq-len 256 --compile \
   --corpus data/lccc_base_train.txt \
   --tokenizer src/stage3_spark/tokenizer_lccc_base_32k.json \
+  --token-cache src/stage3_spark/token_cache_lccc_base_32k.pt \
   --checkpoint-interval 250 --eval-interval 100
 ```
 
@@ -51,10 +52,12 @@ src/stage3_spark/run_train.sh --steps 10000 --d-model 1536 --d-ff 4096 \
   --layers 12 --batch-size 8 --seq-len 256 --compile \
   --corpus data/lccc_base_train.txt \
   --tokenizer src/stage3_spark/tokenizer_lccc_base_32k.json \
+  --token-cache src/stage3_spark/token_cache_lccc_base_32k.pt \
   --resume src/stage3_spark/runs/spark_v5/checkpoint_250.pt
 ```
 
 Training and validation use disjoint contiguous token ranges. Each evaluation
 prints held-out loss/perplexity, spike rate, and a sampled continuation.
 Checkpoints are written atomically and include model, optimizer, global step,
-and token count.
+and token count. The optional token cache is also atomic and is reused only
+when its corpus path, size, timestamp, tokenizer size, and vocabulary match.

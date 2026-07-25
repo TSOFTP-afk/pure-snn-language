@@ -124,12 +124,46 @@ def build_tokenizer(corpus: Path, output: Path, vocab_size: int) -> Tokenizer:
     return tokenizer
 
 
-def load_tokens(corpus: Path, tokenizer: Tokenizer) -> torch.Tensor:
+def load_tokens(corpus: Path, tokenizer: Tokenizer, tokenizer_path: Path,
+                cache_path: Path | None = None) -> torch.Tensor:
+    corpus_stat = corpus.stat()
+    metadata = {
+        "corpus_path": str(corpus.resolve()),
+        "corpus_size": corpus_stat.st_size,
+        "corpus_mtime_ns": corpus_stat.st_mtime_ns,
+        "tokenizer_path": str(tokenizer_path.resolve()),
+        "tokenizer_size": tokenizer_path.stat().st_size,
+        "vocab": tokenizer.get_vocab_size(),
+    }
+    if cache_path and cache_path.exists():
+        cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+        if cached.get("metadata") == metadata:
+            tokens = cached.get("tokens")
+            if isinstance(tokens, torch.Tensor) and tokens.dtype == torch.int32:
+                print(
+                    f"RUN token_cache=hit path={cache_path} "
+                    f"tokens={tokens.numel()}",
+                    flush=True,
+                )
+                return tokens
+        print(f"RUN token_cache=stale path={cache_path}", flush=True)
+
     text = corpus.read_text(encoding="utf-8", errors="replace")
     ids = tokenizer.encode(text).ids
     if len(ids) < 1024:
         raise RuntimeError("corpus is too small after tokenization")
-    return torch.tensor(ids, dtype=torch.long)
+    tokens = torch.tensor(ids, dtype=torch.int32)
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        torch.save({"metadata": metadata, "tokens": tokens}, temporary)
+        os.replace(temporary, cache_path)
+        print(
+            f"RUN token_cache=created path={cache_path} "
+            f"tokens={tokens.numel()}",
+            flush=True,
+        )
+    return tokens
 
 
 def sample_batch(tokens: torch.Tensor, batch: int, seq_len: int,
@@ -141,7 +175,7 @@ def sample_batch(tokens: torch.Tensor, batch: int, seq_len: int,
     )
     offsets = torch.arange(seq_len + 1)
     window = tokens[starts[:, None] + offsets[None, :]].to(device, non_blocking=True)
-    return window[:, :-1], window[:, 1:]
+    return window[:, :-1].long(), window[:, 1:].long()
 
 
 def split_tokens(tokens: torch.Tensor, seq_len: int,
@@ -225,6 +259,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--corpus", default="data/lccc_sample_1mb.txt")
     p.add_argument("--output-dir", default="src/stage3_spark/runs/spark_v5")
     p.add_argument("--tokenizer", default="src/stage3_spark/tokenizer_32k.json")
+    p.add_argument("--token-cache")
     p.add_argument("--vocab-size", type=int, default=32768)
     p.add_argument("--seq-len", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=8)
@@ -275,7 +310,8 @@ def main() -> None:
                  else build_tokenizer(corpus, tokenizer_path, args.vocab_size))
     if tokenizer.decoder is None:
         tokenizer.decoder = ByteLevelDecoder()
-    tokens = load_tokens(corpus, tokenizer)
+    cache_path = Path(args.token_cache) if args.token_cache else None
+    tokens = load_tokens(corpus, tokenizer, tokenizer_path, cache_path)
     train_tokens, val_tokens = split_tokens(tokens, args.seq_len, args.val_fraction)
     train_tokens = train_tokens.pin_memory()
     val_tokens = val_tokens.pin_memory()
