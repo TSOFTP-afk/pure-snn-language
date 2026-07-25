@@ -337,6 +337,9 @@ bool section_layout_matches(const std::vector<Section>& expected,
 int BioMechanismScheduler::save_checkpoint(int next_step, const char* dir,
                                            uint32_t topology_seed) {
     if (!dir || !*dir || next_step < 0) return 1;
+    // Epochs are a transient acceleration cache. Persist fully decayed traces
+    // so the existing checkpoint schema remains backward compatible.
+    materialize_stdp_traces(alloc_, next_step > 0 ? next_step - 1 : 0);
     const cudaError_t sync_err = cudaDeviceSynchronize();
     if (sync_err != cudaSuccess) {
         std::fprintf(stderr, "[Checkpoint] CUDA sync failed: %s\n", cudaGetErrorString(sync_err));
@@ -545,6 +548,9 @@ int BioMechanismScheduler::load_checkpoint(const char* path, int* next_step,
     set_e0_ablation(e0_ablation);
     *next_step = state.next_step;
     *topology_seed = state.topology_seed;
+    // Loaded checkpoints contain eager traces materialized after the previous
+    // step. Seed the transient lazy epochs without changing the file format.
+    reset_stdp_trace_epochs(alloc_, *next_step > 0 ? *next_step - 1 : 0);
     std::printf("[Checkpoint] resumed next_step=%d from %s\n", *next_step, path);
     return 0;
 }

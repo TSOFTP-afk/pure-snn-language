@@ -60,6 +60,10 @@ struct PersistentBuffers {
     // v4 强化 J: STDP x_pre trace (10.7M × 4B = 42.8 MB)
     // x_post trace 已在 BioSynapse 中
     float*             d_stdp_x_pre_trace;
+    // Lazy STDP trace materialization epoch. The large-memory Spark target
+    // trades one int per synapse for avoiding a full expensive trace update
+    // on every time step.
+    int*               d_stdp_trace_epoch;
 
     // v4 强化 K: CaMKII activity (10.7M × 4B = 42.8 MB)
     // autophosph 已在 BioSynapse 中

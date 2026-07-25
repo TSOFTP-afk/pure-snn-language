@@ -39,6 +39,19 @@ namespace stage2e {
 // E0 消融模式 device 开关 (host 端通过 set_e0_ablation 设置)
 __device__ bool g_e0_ablation = false;
 
+__device__ __forceinline__ void materialize_trace_pair(
+    BioSynapse& s, int* trace_epochs, int i, int step)
+{
+    int elapsed = step - trace_epochs[i];
+    if (elapsed > 0) {
+        const float pre_decay = expf(-static_cast<float>(elapsed) / STDP_X_PRE_TAU);
+        const float post_decay = expf(-static_cast<float>(elapsed) / STDP_X_POST_TAU);
+        s.x_pre_trace *= pre_decay;
+        s.x_post_trace *= post_decay;
+        trace_epochs[i] = step;
+    }
+}
+
 // =============================================================================
 // synapse_nmda_kernel: NMDA 受体电压依赖 + 钙浓度更新
 // =============================================================================
@@ -154,6 +167,7 @@ __global__ void stdp_dual_trace_kernel(
     BioSynapse* __restrict__ synapses,
     const bool* __restrict__ spike_flags,
     float* __restrict__ stdp_x_pre_trace,    // 独立数组 (镜像 BioSynapse.x_pre_trace)
+    int* __restrict__ trace_epochs,
     float* __restrict__ synapse_alpha,       // PSW: LTP 证据
     float* __restrict__ synapse_beta,        // PSW: LTD 证据
     const float* __restrict__ da_conc,       // P2: 三因素调制
@@ -172,12 +186,12 @@ __global__ void stdp_dual_trace_kernel(
 
     bool post_spike = spike_flags[post];
 
-    // ----- 1. trace 衰减 -----
-    float x_pre_decay  = expf(-1.0f / STDP_X_PRE_TAU);   // ~0.951
-    float x_post_decay = expf(-1.0f / STDP_X_POST_TAU);  // ~0.951
+    // No post event means no LTP, evidence, weight, or eligibility change.
+    // Delay trace decay until the synapse is next observed.
+    if (!post_spike) return;
 
-    s.x_pre_trace  *= x_pre_decay;
-    s.x_post_trace *= x_post_decay;
+    // ----- 1. trace 衰减 -----
+    materialize_trace_pair(s, trace_epochs, i, step);
 
     // ----- 2. 计算 Δw (必须在更新 last_spike 之前) -----
     // LTP: pre 在 post 之前 → x_pre * post_spike
@@ -258,6 +272,7 @@ __global__ void stdp_arrival_pre_kernel(
     BioSynapse* __restrict__ synapses,
     const int* __restrict__ delay_ring_indices,
     float* __restrict__ stdp_x_pre_trace,
+    int* __restrict__ trace_epochs,
     float* __restrict__ synapse_alpha,        // PSW: LTP 证据
     float* __restrict__ synapse_beta,         // PSW: LTD 证据
     const float* __restrict__ da_conc,        // P2: 三因素调制
@@ -277,6 +292,7 @@ __global__ void stdp_arrival_pre_kernel(
     if (syn_idx < 0) return;
 
     BioSynapse& s = synapses[syn_idx];
+    materialize_trace_pair(s, trace_epochs, syn_idx, step);
     int post = s.post_idx;
     float delta_w = -s.x_post_trace * STDP_A_MINUS_2E;
     s.x_pre_trace += STDP_A_PLUS_2E;
@@ -422,6 +438,7 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
         b.d_synapses,
         b.d_spike_flags,
         b.d_stdp_x_pre_trace,
+        b.d_stdp_trace_epoch,
         b.d_synapse_alpha,
         b.d_synapse_beta,
         b.d_da_concentration,
@@ -438,6 +455,7 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
             b.d_synapses,
             b.d_delay_ring_indices,
             b.d_stdp_x_pre_trace,
+            b.d_stdp_trace_epoch,
             b.d_synapse_alpha,
             b.d_synapse_beta,
             b.d_da_concentration,
@@ -449,6 +467,40 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
             step,
             plasticity_gain);
     }
+}
+
+__global__ void materialize_stdp_traces_kernel(
+    BioSynapse* __restrict__ synapses,
+    float* __restrict__ stdp_x_pre_trace,
+    int* __restrict__ trace_epochs,
+    int n_synapses,
+    int step)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_synapses) return;
+    BioSynapse& s = synapses[i];
+    materialize_trace_pair(s, trace_epochs, i, step);
+    stdp_x_pre_trace[i] = s.x_pre_trace;
+}
+
+__global__ void reset_stdp_trace_epochs_kernel(int* epochs, int n, int step) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) epochs[i] = step;
+}
+
+void materialize_stdp_traces(MemoryAllocator* alloc, int step) {
+    PersistentBuffers& b = alloc->buffers();
+    int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    materialize_stdp_traces_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_synapses, b.d_stdp_x_pre_trace, b.d_stdp_trace_epoch,
+        N_TOTAL_SYNAPSES_2E, step);
+}
+
+void reset_stdp_trace_epochs(MemoryAllocator* alloc, int step) {
+    PersistentBuffers& b = alloc->buffers();
+    int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    reset_stdp_trace_epochs_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_stdp_trace_epoch, N_TOTAL_SYNAPSES_2E, step);
 }
 
 void launch_stdp_stp(MemoryAllocator* alloc, int step, int arrived_ring_idx, int arrived_count) {

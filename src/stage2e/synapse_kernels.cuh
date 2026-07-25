@@ -45,6 +45,11 @@ void launch_synapse_nmda(MemoryAllocator* alloc, int step, int arrived_ring_idx,
 void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_gain,
                             int arrived_ring_idx, int arrived_count);
 
+// Checkpoints keep the historical AoS representation. Materialize lazy
+// traces before saving, and reset transient epochs after loading.
+void materialize_stdp_traces(MemoryAllocator* alloc, int step);
+void reset_stdp_trace_epochs(MemoryAllocator* alloc, int step);
+
 // 短期可塑性 STP (§2.2, Tsodyks-Markram 1998)
 // 输入: d_synapses (resource, utilization), d_spike_flags (pre)
 // 输出: d_synapses (resource, utilization)

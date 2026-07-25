@@ -75,6 +75,7 @@ size_t MemoryAllocator::allocate_all() {
 
     // --- v4 强化 J: STDP x_pre trace ---
     d_bufs_.d_stdp_x_pre_trace  = alloc<float>(N_TOTAL_SYNAPSES_2E, "d_stdp_x_pre_trace", &total);
+    d_bufs_.d_stdp_trace_epoch  = alloc<int>(N_TOTAL_SYNAPSES_2E, "d_stdp_trace_epoch (lazy)", &total);
 
     // --- v4 强化 K: CaMKII activity ---
     d_bufs_.d_camkii_activity   = alloc<float>(N_TOTAL_SYNAPSES_2E, "d_camkii_activity", &total);
@@ -157,6 +158,7 @@ void MemoryAllocator::free_all() {
     FREE_PTR(d_bufs_.d_delay_ring_indices);
     FREE_PTR(d_bufs_.d_delay_ring_current);
     FREE_PTR(d_bufs_.d_stdp_x_pre_trace);
+    FREE_PTR(d_bufs_.d_stdp_trace_epoch);
     FREE_PTR(d_bufs_.d_camkii_activity);
     FREE_PTR(d_bufs_.d_input_current);
     FREE_PTR(d_bufs_.d_nmda_current);
