@@ -63,3 +63,6 @@ and token count. The optional token cache is also atomic and is reused only
 when its corpus path, size, timestamp, tokenizer hash, and vocabulary match.
 The cache is a memory-mapped `int32` stream built from 4 MiB text chunks, so
 preparation does not expand the whole corpus into Python objects.
+
+The launcher refuses to start when its named container already exists. This
+prevents a second invocation from silently terminating an active training run.

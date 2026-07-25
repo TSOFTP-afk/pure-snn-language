@@ -6,7 +6,10 @@ IMAGE="${STAGE3_IMAGE:-flux-train:latest}"
 NAME="${STAGE3_CONTAINER:-pure-snn-stage3}"
 cd "$ROOT"
 
-docker rm -f "$NAME" >/dev/null 2>&1 || true
+if docker inspect "$NAME" >/dev/null 2>&1; then
+  echo "ERROR: container '$NAME' already exists; refusing to interrupt it" >&2
+  exit 1
+fi
 docker run --rm --name "$NAME" --gpus all \
   --user "$(id -u):$(id -g)" \
   -e HOME=/tmp/stage3-home \
