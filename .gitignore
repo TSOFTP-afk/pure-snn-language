@@ -43,6 +43,10 @@ data/*_ckpt.bin
 # 下载地址：https://github.com/thu-coai/CDial-GPT
 data/lccc_base.txt
 data/lccc_base_split.zip
+data/lccc_base_*.jsonl.gz
+data/lccc_base_train.txt
+data/lccc_base_download.log
+data/lccc_base_download.pid
 
 # 工具链副本（CUDA Toolkit / MSVC / Windows SDK 本地副本，1.3GB，不归档）
 # 用户应自行安装 CUDA Toolkit 13.x 和 Visual Studio 2022 Build Tools
