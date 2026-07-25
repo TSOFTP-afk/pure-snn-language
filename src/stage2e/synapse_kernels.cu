@@ -165,6 +165,7 @@ __global__ void synapse_arrival_conductance_kernel(
 // =============================================================================
 __global__ void stdp_dual_trace_kernel(
     BioSynapse* __restrict__ synapses,
+    const int* __restrict__ synapse_post_indices,
     const bool* __restrict__ spike_flags,
     float* __restrict__ stdp_x_pre_trace,    // 独立数组 (镜像 BioSynapse.x_pre_trace)
     int* __restrict__ trace_epochs,
@@ -181,14 +182,18 @@ __global__ void stdp_dual_trace_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_synapses) return;
 
-    BioSynapse& s = synapses[i];
-    int post = s.post_idx;
+    // CSR post indices are contiguous, unlike BioSynapse::post_idx which is
+    // separated by an 80-byte stride. This makes the no-event fast path a
+    // compact read-only scan.
+    int post = synapse_post_indices[i];
 
     bool post_spike = spike_flags[post];
 
     // No post event means no LTP, evidence, weight, or eligibility change.
     // Delay trace decay until the synapse is next observed.
     if (!post_spike) return;
+
+    BioSynapse& s = synapses[i];
 
     // ----- 1. trace 衰减 -----
     materialize_trace_pair(s, trace_epochs, i, step);
@@ -436,6 +441,7 @@ void launch_stdp_dual_trace(MemoryAllocator* alloc, int step, float plasticity_g
     int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     stdp_dual_trace_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         b.d_synapses,
+        b.d_csr_col_idx,
         b.d_spike_flags,
         b.d_stdp_x_pre_trace,
         b.d_stdp_trace_epoch,
