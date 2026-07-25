@@ -26,12 +26,14 @@ int main() {
         stage2e::RunConfig cfg;
         std::string error;
         CHECK(parse({"test", "--steps", "3000000", "--seed", "7", "--device", "1",
+                     "--memory-budget-mb", "65536",
                      "--text", "corpus.txt", "--resume", "checkpoint.bin", "--e0",
                      "--synthetic-input", "--strict-criteria"},
                     &cfg, &error));
         CHECK(cfg.total_steps == 3000000);
         CHECK(cfg.seed == 7);
         CHECK(cfg.device == 1);
+        CHECK(cfg.memory_budget_mb == 65536);
         CHECK(cfg.text_path == "corpus.txt");
         CHECK(cfg.resume_path == "checkpoint.bin");
         CHECK(cfg.e0_mode);
@@ -43,6 +45,11 @@ int main() {
         std::string error;
         CHECK(!parse({"test", "--steps", "0"}, &cfg, &error));
         CHECK(!error.empty());
+    }
+    {
+        stage2e::RunConfig cfg;
+        std::string error;
+        CHECK(!parse({"test", "--memory-budget-mb", "511"}, &cfg, &error));
     }
     {
         stage2e::RunConfig cfg;

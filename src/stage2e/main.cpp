@@ -85,7 +85,10 @@ static void print_experiment_metadata(FILE* fp, const char* prefix,
     emit_run_param(fp, prefix, "gpu_total_mem_mb", "%.0f", prop ? prop->totalGlobalMem / (1024.0 * 1024.0) : 0.0);
     emit_run_param(fp, prefix, "gpu_compute_major", "%d", prop ? prop->major : 0);
     emit_run_param(fp, prefix, "gpu_compute_minor", "%d", prop ? prop->minor : 0);
-    emit_run_param(fp, prefix, "vram_budget_bytes", "%lld", (long long)VRAM_BUDGET_BYTES);
+    emit_run_param(fp, prefix, "memory_budget_mb", "%llu",
+                   static_cast<unsigned long long>(config.memory_budget_mb));
+    emit_run_param(fp, prefix, "vram_budget_bytes", "%llu",
+                   static_cast<unsigned long long>(config.memory_budget_mb * 1024ULL * 1024ULL));
     emit_run_param(fp, prefix, "vram_peak_target_bytes", "%lld", (long long)VRAM_PEAK_TARGET_BYTES);
     emit_run_param(fp, prefix, "n_columns", "%d", N_COLUMNS_2E);
     emit_run_param(fp, prefix, "neurons_per_column", "%d", NEURONS_PER_COLUMN_2E);
@@ -583,7 +586,8 @@ int main(int argc, char** argv) {
     printf("  群体编码:   每柱 K=%d 神经元, 增益 %.1f\n",
            POP_CODING_K_PER_COLUMN, POP_CODING_GAIN);
     printf("  训练步数:   %d\n", total_steps);
-    printf("  显存预算:   1332 MB / 1500 MB (余量 168 MB)\n");
+    printf("  训练内存预算: %llu MiB (可用 --memory-budget-mb 调整)\n",
+           static_cast<unsigned long long>(config.memory_budget_mb));
     printf("============================================================\n\n");
 
     // --- 1. 选择 GPU 设备 ---
@@ -606,7 +610,7 @@ int main(int argc, char** argv) {
     printf("\n");
 
     // --- 2. 显存分配 ---
-    stage2e::MemoryAllocator allocator;
+    stage2e::MemoryAllocator allocator(config.memory_budget_mb * 1024ULL * 1024ULL);
     size_t allocated = allocator.allocate_all();
     if (allocated == 0) {
         fprintf(stderr, "[P1 FAIL] 显存分配失败\n");
@@ -914,18 +918,19 @@ int main(int argc, char** argv) {
            total_steps, no_crash ? "PASS" : "FAIL");
     pass &= no_crash;
 
-    // 判据 3: 显存峰值 < 1332 MB
+    // 判据 3: 显存峰值不超过本次运行配置的预算
     peak_mb = allocator.vram_peak() / (1024 * 1024);
-    vram_ok = (peak_mb < 1332);
-    printf("  [3] 显存峰值 < 1332 MB:             %s (实际 %zu MB)\n",
-           vram_ok ? "PASS" : "FAIL", peak_mb);
+    vram_ok = (allocator.vram_peak() <= allocator.budget_bytes());
+    printf("  [3] 显存峰值 <= 配置预算:             %s (实际 %zu MB / 预算 %llu MB)\n",
+           vram_ok ? "PASS" : "FAIL", peak_mb,
+           static_cast<unsigned long long>(config.memory_budget_mb));
     pass &= vram_ok;
 
-    // 判据 4: 显存 < 1.5 GB 上限
-    vram_limit = (allocator.vram_used() < VRAM_BUDGET_BYTES);
-    printf("  [4] 显存 < 1.5GB 上限:              %s (%.1f%% 利用率)\n",
+    // 判据 4: 持久分配不超过配置预算
+    vram_limit = (allocator.vram_used() <= allocator.budget_bytes());
+    printf("  [4] 持久显存 <= 配置预算:            %s (%.1f%% 利用率)\n",
            vram_limit ? "PASS" : "FAIL",
-           allocator.vram_used() * 100.0 / VRAM_BUDGET_BYTES);
+           allocator.vram_used() * 100.0 / allocator.budget_bytes());
     pass &= vram_limit;
 
     // 判据 5: spike count 极差 > 100 (P1 核心判据)

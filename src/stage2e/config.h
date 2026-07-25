@@ -11,7 +11,7 @@
 //   - 突触: 10.7M (含前额叶自反馈 + 跨柱连接)
 //   - 柱数: 50 (柱内 L4/L2-3/L5/L6 四层皮层结构, Phase R2 模块 C)
 //   - 抑制亚型: 3 种 (FS/LTS/SOM)
-//   - 显存预算: 1332MB / 1.5GB (余量 168MB)
+//   - 原始显存目标: 1332MB；DGX Spark 默认训练预算: 32GiB
 //   - 训练步数: 3M (5 个发育阶段)
 //
 // 硬约束 (项目记忆):
@@ -414,7 +414,7 @@ static_assert(PREFRONTAL_GROUPS * NEURONS_PER_PF_GROUP == N_PREFRONTAL_NEURONS,
 #define CHECKPOINT_INTERVAL_2E    50000
 
 // 显存预算
-#define VRAM_BUDGET_BYTES         (1500LL * 1024 * 1024)   // 1.5 GB
+#define DEFAULT_VRAM_BUDGET_MB    32768ULL                  // DGX Spark default: 32 GiB
 #define VRAM_PEAK_TARGET_BYTES    (1332LL * 1024 * 1024)   // v4 目标峰值
 
 // -----------------------------------------------------------------------------

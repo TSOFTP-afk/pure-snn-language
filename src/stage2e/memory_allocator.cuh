@@ -4,7 +4,7 @@
 // =============================================================================
 // Stage 2e 显存分配器 (P0)
 // =============================================================================
-// 对应设计文档 §5.2: v4 显存预算 1332MB / 1.5GB
+// 原始设计目标为 1332MB；运行预算由 --memory-budget-mb 配置。
 //
 // P0 职责:
 //   1. 一次性分配所有持久 GPU 缓冲 (1242MB)
@@ -111,7 +111,9 @@ struct PersistentBuffers {
 // -----------------------------------------------------------------------------
 class MemoryAllocator {
 public:
-    MemoryAllocator() : d_bufs_{}, vram_peak_(0), vram_used_(0), allocation_failed_(false) {}
+    explicit MemoryAllocator(size_t budget_bytes = DEFAULT_VRAM_BUDGET_MB * 1024ULL * 1024ULL)
+        : d_bufs_{}, vram_used_(0), vram_peak_(0), budget_bytes_(budget_bytes),
+          allocation_failed_(false) {}
     ~MemoryAllocator() { free_all(); }
 
     // 分配所有持久缓冲 (返回总字节数, 失败返回 0)
@@ -127,8 +129,9 @@ public:
     // 显存统计
     size_t vram_used() const { return vram_used_; }
     size_t vram_peak() const { return vram_peak_; }
+    size_t budget_bytes() const { return budget_bytes_; }
 
-    // 检查显存是否超预算 (1.4GB 警告线)
+    // 检查显存是否超过本次运行预算 (90% 时警告)
     bool check_budget() const;
 
     // 打印显存预算表
@@ -138,6 +141,7 @@ private:
     PersistentBuffers d_bufs_;
     size_t vram_used_;
     size_t vram_peak_;
+    size_t budget_bytes_;
     bool allocation_failed_;
 
     // 模板化分配助手

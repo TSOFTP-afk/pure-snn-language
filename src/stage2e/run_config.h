@@ -1,6 +1,7 @@
 #ifndef SNN_STAGE2E_RUN_CONFIG_H
 #define SNN_STAGE2E_RUN_CONFIG_H
 
+#include "config.h"
 #include <cstdint>
 #include <string>
 
@@ -10,6 +11,7 @@ struct RunConfig {
     int total_steps = 10000;
     int device = 0;
     uint32_t seed = 42;
+    uint64_t memory_budget_mb = DEFAULT_VRAM_BUDGET_MB;
     int checkpoint_interval = 50000;
     int keep_checkpoints = 3;
     bool e0_mode = false;

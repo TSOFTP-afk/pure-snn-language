@@ -185,18 +185,16 @@ void MemoryAllocator::free_all() {
 }
 
 bool MemoryAllocator::check_budget() const {
-    const size_t WARN_BYTES   = 1400LL * 1024 * 1024;  // 1.4 GB 警告
-    const size_t LIMIT_BYTES  = 1500LL * 1024 * 1024;  // 1.5 GB 上限
-    if (vram_used_ > LIMIT_BYTES) {
+    if (vram_used_ > budget_bytes_) {
         fprintf(stderr, "[Stage2e] 显存超预算! 已用 %.2f MB > 上限 %.2f MB\n",
                 vram_used_ / (1024.0 * 1024.0),
-                LIMIT_BYTES / (1024.0 * 1024.0));
+                budget_bytes_ / (1024.0 * 1024.0));
         return false;
     }
-    if (vram_used_ > WARN_BYTES) {
+    if (vram_used_ > budget_bytes_ * 9 / 10) {
         fprintf(stderr, "[Stage2e] 警告: 显存接近预算上限 (%.2f MB / %.2f MB)\n",
                 vram_used_ / (1024.0 * 1024.0),
-                LIMIT_BYTES / (1024.0 * 1024.0));
+                budget_bytes_ / (1024.0 * 1024.0));
     }
     return true;
 }
@@ -206,10 +204,13 @@ void MemoryAllocator::print_budget_report() const {
     printf("  持久分配:       %.2f MB\n", vram_used_ / (1024.0 * 1024.0));
     printf("  峰值 (含临时):  %.2f MB\n", vram_peak_ / (1024.0 * 1024.0));
     printf("  v4 预算目标:    1332 MB\n");
-    printf("  1.5GB 上限:     %s\n", vram_used_ < VRAM_BUDGET_BYTES ? "OK" : "OVER");
+    printf("  配置预算:       %.2f GB (%s)\n",
+           budget_bytes_ / (1024.0 * 1024.0 * 1024.0),
+           vram_used_ <= budget_bytes_ ? "OK" : "OVER");
     printf("  余量:           %.2f MB (%.1f%%)\n",
-           (VRAM_BUDGET_BYTES - vram_used_) / (1024.0 * 1024.0),
-           (VRAM_BUDGET_BYTES - vram_used_) * 100.0 / VRAM_BUDGET_BYTES);
+           budget_bytes_ > vram_used_ ? (budget_bytes_ - vram_used_) / (1024.0 * 1024.0) : 0.0,
+           budget_bytes_ > vram_used_
+               ? (budget_bytes_ - vram_used_) * 100.0 / budget_bytes_ : 0.0);
     printf("==============================================\n\n");
 
     // 查询 GPU 实际显存

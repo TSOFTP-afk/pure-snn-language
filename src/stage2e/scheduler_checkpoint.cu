@@ -337,7 +337,7 @@ bool section_layout_matches(const std::vector<Section>& expected,
 int BioMechanismScheduler::save_checkpoint(int next_step, const char* dir,
                                            uint32_t topology_seed) {
     if (!dir || !*dir || next_step < 0) return 1;
-    // Epochs are a transient acceleration cache. Persist fully decayed traces
+    // b.d_stdp_trace_epoch is a transient acceleration cache. Persist fully decayed traces
     // so the existing checkpoint schema remains backward compatible.
     materialize_stdp_traces(alloc_, next_step > 0 ? next_step - 1 : 0);
     const cudaError_t sync_err = cudaDeviceSynchronize();

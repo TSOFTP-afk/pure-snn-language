@@ -76,6 +76,10 @@ bool parse_run_config(int argc, char** argv, RunConfig* config, std::string* err
             value = require_value(&i, "--device");
             if (!value || !parse_long(value, 0, INT_MAX, "--device", &parsed, error)) return false;
             config->device = static_cast<int>(parsed);
+        } else if (arg == "--memory-budget-mb") {
+            value = require_value(&i, "--memory-budget-mb");
+            if (!value || !parse_long(value, 512, LONG_MAX, "--memory-budget-mb", &parsed, error)) return false;
+            config->memory_budget_mb = static_cast<uint64_t>(parsed);
         } else if (arg == "--seed") {
             value = require_value(&i, "--seed");
             if (!value || !parse_u32(value, "--seed", &config->seed, error)) return false;
@@ -121,6 +125,7 @@ const char* run_config_usage() {
         "Usage: snn_stage2e_p1 [options]\n"
         "  --steps N                 stop at absolute step N (default: 10000)\n"
         "  --device N                CUDA device index (default: 0)\n"
+        "  --memory-budget-mb N      allocator budget in MiB (default: 32768)\n"
         "  --seed N                  topology seed (default: 42)\n"
         "  --text PATH               UTF-8 byte corpus path\n"
         "  --csv PATH                optional per-step diagnostic CSV\n"
