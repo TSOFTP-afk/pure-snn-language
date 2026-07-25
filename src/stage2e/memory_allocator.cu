@@ -94,12 +94,24 @@ size_t MemoryAllocator::allocate_all() {
 
     // --- v3 强化 C: 海马体索引 ---
     d_bufs_.d_hippo_indices     = alloc<HippoIndex>(HIPP_INDEX_SIZE, "d_hippo_indices", &total);
+    // Task 3: 海马 LRU 游标 + 已填充计数 + top-K 索引缓冲 (1 + 1 + 200 int = 808B)
+    //   alloc() 已 cudaMemset 为 0: write_cursor=0, filled_count=0, top_k 全 0
+    d_bufs_.d_hippo_write_cursor = alloc<int>(1, "d_hippo_write_cursor", &total);
+    d_bufs_.d_hippo_filled_count = alloc<int>(1, "d_hippo_filled_count", &total);
+    d_bufs_.d_hippo_top_k        = alloc<int>(HIPP_REPLAY_BATCH, "d_hippo_top_k", &total);
 
     // --- v3 强化 D: 共激活跟踪器 ---
     d_bufs_.d_coact_trackers    = alloc<CoactTracker>(COACT_TRACKER_SIZE, "d_coact_trackers", &total);
+    // Task 6: tracker 条目计数 (append-only; alloc 已 cudaMemset 为 0)
+    d_bufs_.d_tracker_count     = alloc<int>(1, "d_tracker_count", &total);
 
     // --- v3 强化 E: 工作记忆槽位 ---
     d_bufs_.d_wm_slots          = alloc<WMSlot>(WM_SLOTS, "d_wm_slots", &total);
+
+    // --- Task 9: WM 完整闭环缓冲 (LRU 游标 + 前额叶输入电流) ---
+    d_bufs_.d_wm_write_cursor   = alloc<int>(1, "d_wm_write_cursor (LRU)", &total);
+    d_bufs_.d_prefrontal_input  = alloc<float>(N_PREFRONTAL_NEURONS,
+                                                "d_prefrontal_input (5K)", &total);
 
     // --- DA 价值函数相关 ---
     d_bufs_.d_subcolumn_fr      = alloc<float>(W_VALUE_DIM, "d_subcolumn_fr", &total);
@@ -107,6 +119,8 @@ size_t MemoryAllocator::allocate_all() {
     d_bufs_.d_w_pred            = alloc<float>((size_t)W_PRED_DIM * W_PRED_DIM, "d_w_pred (200×200)", &total);
     d_bufs_.d_w_value           = alloc<float>(W_VALUE_DIM, "d_w_value", &total);
     d_bufs_.d_pred_fr           = alloc<float>(W_PRED_DIM, "d_pred_fr", &total);
+    // 上一步亚柱发放率 (W_pred 完整矩阵预测输入, 200 × 4B = 800 字节)
+    d_bufs_.d_subcol_fr_prev    = alloc<float>(W_VALUE_DIM, "d_subcol_fr_prev", &total);
 
     // --- 字节直方图 (NE 用) ---
     d_bufs_.d_byte_histogram    = alloc<int>(256, "d_byte_histogram", &total);
@@ -117,6 +131,38 @@ size_t MemoryAllocator::allocate_all() {
 
     // --- 重放注入缓冲 ---
     d_bufs_.d_replay_injection  = alloc<float>(N_TOTAL_NEURONS_2E, "d_replay_injection", &total);
+
+    // -----------------------------------------------------------------
+    // 语言运动皮层 (Stage 2e "语言运动皮层"基础设施)
+    // 新增显存约 79 MB (主要项: d_decode_weights 58.6 MB + d_l5_to_motor_synapses 19 MB)
+    // -----------------------------------------------------------------
+    // 运动皮层神经元状态 (5K × 56B = 0.28 MB) + 脉冲标志 (5K × 1B = 5 KB)
+    d_bufs_.d_motor_neurons        = alloc<NeuronStateAdEx>(N_MOTOR_NEURONS,
+                                                            "d_motor_neurons", &total);
+    d_bufs_.d_motor_spike_flags    = alloc<bool>(N_MOTOR_NEURONS,
+                                                 "d_motor_spike_flags", &total);
+
+    // 线性解码器权重矩阵 (60K × 256 × 4B = 58.6 MB, 最大项)
+    d_bufs_.d_decode_weights       = alloc<float>((size_t)N_TOTAL_NEURONS_2E * 256,
+                                                  "d_decode_weights (60K×256)", &total);
+    // 解码 logits / 误差 (256 × 4B = 1 KB)
+    d_bufs_.d_decode_logits        = alloc<float>(256, "d_decode_logits", &total);
+    d_bufs_.d_decode_error         = alloc<float>(256, "d_decode_error", &total);
+    // 预测字节 (1 × 4B, host-readable)
+    d_bufs_.d_decode_predicted_byte = alloc<int>(1, "d_decode_predicted_byte", &total);
+
+    // L5 → 运动皮层稀疏 CSR 突触
+    // 突触数 = N_MOTOR_NEURONS × L5_TO_MOTOR_SYNAPSES_PER_NEURON = 5000 × 50 = 250,000
+    // BioSynapse 80B × 250K = 19 MB
+    const size_t n_l5_motor_syn = (size_t)N_MOTOR_NEURONS * L5_TO_MOTOR_SYNAPSES_PER_NEURON;
+    d_bufs_.d_l5_to_motor_synapses     = alloc<BioSynapse>(n_l5_motor_syn,
+                                                            "d_l5_to_motor_synapses", &total);
+    d_bufs_.d_l5_to_motor_weights      = alloc<float>(n_l5_motor_syn,
+                                                       "d_l5_to_motor_weights", &total);
+    d_bufs_.d_l5_to_motor_csr_row_ptr  = alloc<int>(N_MOTOR_NEURONS + 1,
+                                                    "d_l5_to_motor_csr_row_ptr", &total);
+    d_bufs_.d_l5_to_motor_csr_col_idx  = alloc<int>(n_l5_motor_syn,
+                                                    "d_l5_to_motor_csr_col_idx", &total);
 
     printf("  %-34s %10s %8s %10s %10s\n",
            "------", "-----", "----", "-----", "--------");
@@ -170,16 +216,37 @@ void MemoryAllocator::free_all() {
     FREE_PTR(d_bufs_.d_ne_concentration);
     FREE_PTR(d_bufs_.d_ht5_concentration);
     FREE_PTR(d_bufs_.d_hippo_indices);
+    // Task 3: 海马 LRU 游标 + filled_count + top-K 缓冲释放
+    FREE_PTR(d_bufs_.d_hippo_write_cursor);
+    FREE_PTR(d_bufs_.d_hippo_filled_count);
+    FREE_PTR(d_bufs_.d_hippo_top_k);
     FREE_PTR(d_bufs_.d_coact_trackers);
+    FREE_PTR(d_bufs_.d_tracker_count);
     FREE_PTR(d_bufs_.d_wm_slots);
+    // Task 9: WM 完整闭环缓冲释放
+    FREE_PTR(d_bufs_.d_wm_write_cursor);
+    FREE_PTR(d_bufs_.d_prefrontal_input);
     FREE_PTR(d_bufs_.d_subcolumn_fr);
     FREE_PTR(d_bufs_.d_baseline_fr);
     FREE_PTR(d_bufs_.d_w_pred);
     FREE_PTR(d_bufs_.d_w_value);
     FREE_PTR(d_bufs_.d_pred_fr);
+    FREE_PTR(d_bufs_.d_subcol_fr_prev);
     FREE_PTR(d_bufs_.d_byte_histogram);
     FREE_PTR(d_bufs_.d_neuron_byte_counts);
     FREE_PTR(d_bufs_.d_replay_injection);
+
+    // 语言运动皮层缓冲区释放
+    FREE_PTR(d_bufs_.d_motor_neurons);
+    FREE_PTR(d_bufs_.d_motor_spike_flags);
+    FREE_PTR(d_bufs_.d_decode_weights);
+    FREE_PTR(d_bufs_.d_decode_logits);
+    FREE_PTR(d_bufs_.d_decode_error);
+    FREE_PTR(d_bufs_.d_decode_predicted_byte);
+    FREE_PTR(d_bufs_.d_l5_to_motor_synapses);
+    FREE_PTR(d_bufs_.d_l5_to_motor_weights);
+    FREE_PTR(d_bufs_.d_l5_to_motor_csr_row_ptr);
+    FREE_PTR(d_bufs_.d_l5_to_motor_csr_col_idx);
 
     #undef FREE_PTR
 

@@ -102,12 +102,10 @@ __global__ void value_function_kernel(
 }
 
 // TD学习: w_value += η · δ · φ(s)
-// w_pred 更新: w_pred += η_pred · δ_pred · φ(s)
+// 注意: W_pred 完整矩阵更新已移至 w_pred_update_kernel (Task 10)
 __global__ void td_update_kernel(
     float* __restrict__ w_value,
-    float* __restrict__ w_pred,
     const float* __restrict__ subcolumn_fr,
-    const float* __restrict__ baseline_fr,
     float delta,
     int dim)
 {
@@ -119,19 +117,12 @@ __global__ void td_update_kernel(
     // clamp 防发散
     if (w_value[k] > 1.0f) w_value[k] = 1.0f;
     if (w_value[k] < -1.0f) w_value[k] = -1.0f;
-
-    // w_pred 更新 (预测器: 预测下一步 fr)
-    // 简化: w_pred 对角项增强
-    float pred_error = subcolumn_fr[k] - baseline_fr[k];
-    w_pred[k * dim + k] += ETA_PRED * pred_error * subcolumn_fr[k];
 }
 
-// EMA 基线更新 + 预测 fr
+// EMA 基线更新 (W_pred 预测已移至 w_pred_predict_kernel, Task 10)
 __global__ void baseline_update_kernel(
     float* __restrict__ baseline_fr,
-    float* __restrict__ pred_fr,
     const float* __restrict__ subcolumn_fr,
-    const float* __restrict__ w_pred,
     int dim)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -140,9 +131,80 @@ __global__ void baseline_update_kernel(
     // EMA 基线
     baseline_fr[k] = NOVELTY_EMA_BETA * baseline_fr[k]
                    + (1.0f - NOVELTY_EMA_BETA) * subcolumn_fr[k];
+}
 
-    // 预测 fr (简化: 仅对角项)
-    pred_fr[k] = w_pred[k * dim + k] * subcolumn_fr[k];
+// ==================== Task 10: W_pred 完整矩阵 ====================
+
+// W_pred 完整矩阵预测: pred_fr[j] = Σ_k w_pred[j*dim+k] * fr_prev[k]
+// 每 thread 处理一个 j (200 个线程), 内部循环 k (200 次)
+// 矩阵布局: row-major, w_pred[j*dim+k] 是第 j 行第 k 列
+__global__ void w_pred_predict_kernel(
+    float* __restrict__ pred_fr,
+    const float* __restrict__ w_pred,
+    const float* __restrict__ fr_prev,    // 上一步亚柱发放率
+    int dim)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= dim) return;
+
+    // 完整矩阵-向量乘法: pred_fr = W_pred · fr_prev
+    float sum = 0.0f;
+    for (int k = 0; k < dim; ++k) {
+        sum += w_pred[j * dim + k] * fr_prev[k];
+    }
+    pred_fr[j] = sum;
+}
+
+// W_pred 完整矩阵更新: w_pred[j*dim+k] += η_pred · (fr_j - pred_j) · fr_k_prev
+// 每 thread 处理一个 j (200 个线程), 内部循环 k (200 次)
+// 学习规则: 预测误差 (fr_j - pred_j) × 输入 fr_k_prev 的外积
+__global__ void w_pred_update_kernel(
+    float* __restrict__ w_pred,
+    const float* __restrict__ subcolumn_fr,   // 当前亚柱发放率 fr_j
+    const float* __restrict__ pred_fr,         // 当前预测 pred_j
+    const float* __restrict__ fr_prev,         // 上一步亚柱发放率 fr_k_prev
+    int dim)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= dim) return;
+
+    // 第 j 行的预测误差
+    float pred_error = subcolumn_fr[j] - pred_fr[j];
+    // 更新第 j 行所有列 k: w_pred[j*dim+k] += η_pred · pred_error · fr_prev[k]
+    for (int k = 0; k < dim; ++k) {
+        w_pred[j * dim + k] += ETA_PRED * pred_error * fr_prev[k];
+        // clamp 防发散 (与原对角项更新一致)
+        if (w_pred[j * dim + k] > 1.0f) w_pred[j * dim + k] = 1.0f;
+        if (w_pred[j * dim + k] < -1.0f) w_pred[j * dim + k] = -1.0f;
+    }
+}
+
+// 预测成功率 (余弦相似度): pred_succ = (cos(pred_fr, fr_subcol) + 1) / 2
+// 单线程计算 (200 维, 计算量小, 启动开销不值得并行化)
+// 余弦相似度 ∈ [-1, 1], 映射到 [0, 1] 用于 ACh 注意力调制
+__global__ void cosine_similarity_kernel(
+    const float* __restrict__ pred_fr,
+    const float* __restrict__ subcolumn_fr,
+    float* __restrict__ out_pred_succ,
+    int dim)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        float dot = 0.0f;
+        float norm_pred = 0.0f;
+        float norm_fr = 0.0f;
+        for (int k = 0; k < dim; ++k) {
+            dot += pred_fr[k] * subcolumn_fr[k];
+            norm_pred += pred_fr[k] * pred_fr[k];
+            norm_fr += subcolumn_fr[k] * subcolumn_fr[k];
+        }
+        norm_pred = sqrtf(norm_pred);
+        norm_fr = sqrtf(norm_fr);
+        float denom = norm_pred * norm_fr;
+        // 防 0 除 (冷启动时 fr_prev=0 → pred_fr=0, 范数为 0)
+        float cos_sim = (denom > 1e-8f) ? (dot / denom) : 0.0f;
+        // 映射到 [0, 1]: (cos + 1) / 2
+        *out_pred_succ = (cos_sim + 1.0f) * 0.5f;
+    }
 }
 
 // 字节选择性直方图 (每注入步)
@@ -166,6 +228,11 @@ static float h_v_s = 0.0f;
 static float h_v_sp = 0.0f;
 static float* d_v_scratch = nullptr;
 
+// Task 10: 预测成功率 (余弦相似度版本, 由 launch_da_value_function 计算)
+// launch_modulatory 使用此值替代外部传入的二元 pred_succ
+static float h_pred_succ_cos = 0.5f;   // 冷启动默认 0.5 (中性)
+static float* d_pred_succ_scratch = nullptr;
+
 ModulatoryRuntimeState export_modulatory_runtime_state() {
     return {h_v_s, h_v_sp};
 }
@@ -173,6 +240,7 @@ ModulatoryRuntimeState export_modulatory_runtime_state() {
 void import_modulatory_runtime_state(const ModulatoryRuntimeState& state) {
     h_v_s = state.v_s;
     h_v_sp = state.v_sp;
+    // h_pred_succ_cos 不持久化: 重启后由下一步 launch_da_value_function 重算
 }
 
 static void ensure_v_scratch() {
@@ -182,21 +250,42 @@ static void ensure_v_scratch() {
     }
 }
 
+static void ensure_pred_succ_scratch() {
+    if (d_pred_succ_scratch == nullptr) {
+        cudaMalloc(&d_pred_succ_scratch, sizeof(float));
+        cudaMemset(d_pred_succ_scratch, 0, sizeof(float));
+    }
+}
+
 void launch_modulatory(MemoryAllocator* alloc, int step,
                        float reward_signal, float novelty,
                        float pred_succ, float kl_divergence,
-                       float da_delta)
+                       float da_delta,
+                       float prediction_error_norm)
 {
     PersistentBuffers& b = alloc->buffers();
+    // DA 释放覆盖 [0, N_TOTAL_NEURONS_2E) = [0, 60000)
+    // 包含联合皮层 (50K) + 前额叶 (5K) + 运动皮层范围 (5K)
+    // (d_da_concentration 已分配 N_TOTAL_NEURONS_2E=60000 个槽位)
     int blocks = (N_TOTAL_NEURONS_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
 
     // 调质信号计算
-    // DA: δ(t) 驱动, 基线 0.1
-    float da_signal = 0.1f + (da_delta > 0 ? da_delta : 0.3f * da_delta);
+    // DA 信号 = 基线 + 预测误差耦合 + TD error 驱动
+    // 预测误差耦合: DA_BASE + DA_GAIN × (1 - ||error||)
+    //   ||error|| ∈ [0, ~1.414] (256维 one-hot 误差的 L2 范数)
+    //   预测越准 (||error|| 越小) → DA 越高 (奖励预测准确性)
+    //   DA_BASE=0.1, DA_GAIN=0.5 → 基线项 ∈ [-0.107, 0.6], 负值由 clamp 处理
+    float da_signal = DA_BASE + DA_GAIN * (1.0f - prediction_error_norm);
+    // TD error 驱动 (保留原有逻辑: 正 δ 全量传递, 负 δ 衰减 0.3 倍)
+    da_signal += (da_delta > 0 ? da_delta : 0.3f * da_delta);
     if (da_signal < 0.0f) da_signal = 0.0f;
 
-    // ACh: 基线 0.2 + 惊奇 (novelty) + 注意力 (gamma sync 简化为 pred_succ)
-    float ach_signal = 0.2f + 0.3f * novelty + 0.1f * pred_succ;
+    // ACh: 基线 0.2 + 惊奇 (novelty) + 注意力 (余弦相似度预测成功率)
+    // Task 10: 改用 h_pred_succ_cos (由 launch_da_value_function 通过 cosine_similarity 计算)
+    //   替代外部传入的二元 pred_succ (spike 范围判断)
+    //   pred_succ = (cos(pred_fr, fr_subcol) + 1) / 2 ∈ [0, 1]
+    //   pred_fr 与当前 fr 越相似 → ACh 越高 (注意力聚焦于已验证的预测)
+    float ach_signal = 0.2f + 0.3f * novelty + 0.1f * h_pred_succ_cos;
 
     // NE: 基线 0.05 + KL 散度触发
     float ne_signal = 0.05f;
@@ -229,34 +318,57 @@ void launch_da_value_function(MemoryAllocator* alloc, int step,
 {
     PersistentBuffers& b = alloc->buffers();
     ensure_v_scratch();
+    ensure_pred_succ_scratch();
 
-    // 1. 计算亚柱发放直方图 (200维)
+    // 1. 计算亚柱发放直方图 (200维, 当前步 subcolumn_fr)
     int neurons_per_sc = N_TOTAL_NEURONS_2E / W_VALUE_DIM;
     int sc_blocks = (W_VALUE_DIM + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     subcolumn_fr_kernel<<<sc_blocks, THREADS_PER_BLOCK_2E>>>(
         b.d_spike_flags, b.d_subcolumn_fr, N_TOTAL_NEURONS_2E, neurons_per_sc);
 
-    // 2. 计算 V(s) (当前)
+    // 2. 计算 V(s) = w_value · subcolumn_fr (当前状态价值)
     value_function_kernel<<<1, 1>>>(
         b.d_subcolumn_fr, b.d_w_value, d_v_scratch, W_VALUE_DIM);
-    cudaMemcpy(&h_v_s, d_v_scratch, sizeof(float), cudaMemcpyDeviceToHost);
+    CUDA_CHECK_2E(cudaMemcpy(&h_v_s, d_v_scratch, sizeof(float), cudaMemcpyDeviceToHost));
 
-    // 3. EMA 基线更新 + 预测 fr (得到 V(s') 的近似)
+    // 3. W_pred 完整矩阵预测: pred_fr[j] = Σ_k w_pred[j*dim+k] * fr_prev[k]
+    //    使用上一步的 subcolumn_fr (d_subcol_fr_prev) 作为输入
+    //    冷启动首步 fr_prev=0 → pred_fr=0, 由 cosine_similarity_kernel 防 0 除处理
+    w_pred_predict_kernel<<<sc_blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_pred_fr, b.d_w_pred, b.d_subcol_fr_prev, W_VALUE_DIM);
+
+    // 4. 计算预测成功率 (余弦相似度, Task 10)
+    //    pred_succ = (cos(pred_fr, subcolumn_fr) + 1) / 2 ∈ [0, 1]
+    //    pred_fr 基于上一步 fr 预测当前 fr, 与当前实际 fr 对比
+    cosine_similarity_kernel<<<1, 1>>>(
+        b.d_pred_fr, b.d_subcolumn_fr, d_pred_succ_scratch, W_VALUE_DIM);
+    CUDA_CHECK_2E(cudaMemcpy(&h_pred_succ_cos, d_pred_succ_scratch,
+                              sizeof(float), cudaMemcpyDeviceToHost));
+
+    // 5. EMA 基线更新 (仅 EMA, pred_fr 已由步骤 3 计算)
     baseline_update_kernel<<<sc_blocks, THREADS_PER_BLOCK_2E>>>(
-        b.d_baseline_fr, b.d_pred_fr, b.d_subcolumn_fr, b.d_w_pred, W_VALUE_DIM);
+        b.d_baseline_fr, b.d_subcolumn_fr, W_VALUE_DIM);
 
-    // 4. 计算 V(s') (用预测的 fr)
+    // 6. 计算 V(s') = w_value · pred_fr (用预测的 fr 估计下一状态价值)
     value_function_kernel<<<1, 1>>>(
         b.d_pred_fr, b.d_w_value, d_v_scratch, W_VALUE_DIM);
-    cudaMemcpy(&h_v_sp, d_v_scratch, sizeof(float), cudaMemcpyDeviceToHost);
+    CUDA_CHECK_2E(cudaMemcpy(&h_v_sp, d_v_scratch, sizeof(float), cudaMemcpyDeviceToHost));
 
-    // 5. TD error: δ = R + γ·V(s') - V(s)
+    // 7. TD error: δ = R + γ·V(s') - V(s)
     float delta = reward + TD_GAMMA * h_v_sp - h_v_s;
 
-    // 6. TD 学习更新
+    // 8. w_value TD 学习更新 (w_pred 更新已拆分至步骤 9)
     td_update_kernel<<<sc_blocks, THREADS_PER_BLOCK_2E>>>(
-        b.d_w_value, b.d_w_pred, b.d_subcolumn_fr, b.d_baseline_fr,
-        delta, W_VALUE_DIM);
+        b.d_w_value, b.d_subcolumn_fr, delta, W_VALUE_DIM);
+
+    // 9. W_pred 完整矩阵更新: w_pred[j*dim+k] += η_pred · (fr_j - pred_j) · fr_k_prev
+    //    外积更新: 预测误差 (fr - pred) × 上一步输入 fr_prev
+    w_pred_update_kernel<<<sc_blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_w_pred, b.d_subcolumn_fr, b.d_pred_fr, b.d_subcol_fr_prev, W_VALUE_DIM);
+
+    // 10. 保存当前 subcolumn_fr 到 d_subcol_fr_prev (供下一步预测使用)
+    CUDA_CHECK_2E(cudaMemcpy(b.d_subcol_fr_prev, b.d_subcolumn_fr,
+                              W_VALUE_DIM * sizeof(float), cudaMemcpyDeviceToDevice));
 
     if (out_v_s)  *out_v_s  = h_v_s;
     if (out_v_sp) *out_v_sp = h_v_sp;
@@ -302,6 +414,8 @@ ModulatoryStats get_modulatory_stats(MemoryAllocator* alloc)
     stats.ht5_mean = static_cast<float>(s_ht5 / sample);
     stats.v_s  = h_v_s;
     stats.v_sp = h_v_sp;
+    // Task 10: 预测成功率 = 余弦相似度版本 (替代原二元判断)
+    stats.pred_succ = h_pred_succ_cos;
     return stats;
 }
 

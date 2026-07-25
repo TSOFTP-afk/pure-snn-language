@@ -530,6 +530,188 @@ int init_synapses(BioSynapse* d_synapses,
 }
 
 // -----------------------------------------------------------------------------
+// Kernel: 初始化运动皮层 AdEx 神经元 (5K, 静息电位 -70mV)
+// 与现有 init_neurons_kernel 模式一致, 但 region = REGION_MOTOR
+// 神经元布局: 50 群 × 100 神经元 = 5000, 每群对应一个柱的 L5 输出
+// -----------------------------------------------------------------------------
+__global__ void init_motor_neurons_kernel(NeuronStateAdEx* neurons) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N_MOTOR_NEURONS) return;
+
+    NeuronStateAdEx& n = neurons[i];
+
+    // AdEx 静息状态 (V_norm = 0, 对应 V_bio = -70 mV)
+    n.membrane_potential   = 0.0f;
+    n.synaptic_current     = 0.0f;
+    n.nmda_current         = 0.0f;
+    n.adaptive_conductance = 0.0f;       // w = 0 (无初始适应)
+    n.last_spike_time      = -1000;       // 远古值
+    n.fire_rate            = 0.0f;
+    n.refractory_remaining = 0;
+    n.ca_neuron            = 0.0f;
+    n.wm_injection         = 0.0f;
+    n.homeostatic_factor   = 1.0f;       // 初始缩放 = 1.0
+
+    // 运动皮层分组: 50 群 × 100 神经元, 每群对应一个柱 (column_id = motor_group)
+    int motor_group  = i / MOTOR_GROUP_SIZE;     // 0..49
+    int off_in_group = i % MOTOR_GROUP_SIZE;     // 0..99
+    n.column_id          = static_cast<uint8_t>(motor_group);
+    n.pf_group_id        = -1;                    // 非前额叶
+    n.region             = REGION_MOTOR;           // 5 = 运动皮层
+
+    // 80/20 兴奋/抑制 (每群内独立维持, 前 80% 兴奋, 与现有层内分配模式一致)
+    int exc_count = static_cast<int>(MOTOR_GROUP_SIZE * EXCITATORY_RATIO_2E);
+    if (off_in_group < exc_count) {
+        n.neuron_type         = 0;   // EXCITATORY
+        n.inhibitory_subtype  = 0;   // NONE
+    } else {
+        n.neuron_type         = 1;   // INHIBITORY
+        n.inhibitory_subtype  = 1;   // FS (运动皮层输出神经元主要为 PV+ 快速放电型)
+    }
+
+    // 阈值偏移初始 0
+    n.threshold_offset = 0;
+    n._reserved = 0;
+    n._pad = 0;
+}
+
+// -----------------------------------------------------------------------------
+// Host: 初始化运动皮层神经元
+// -----------------------------------------------------------------------------
+void init_motor_neurons(NeuronStateAdEx* d_motor_neurons) {
+    int blocks = (N_MOTOR_NEURONS + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    init_motor_neurons_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(d_motor_neurons);
+    CUDA_CHECK_LAST_2E();
+}
+
+// -----------------------------------------------------------------------------
+// Host: 生成 L5 → 运动皮层稀疏 CSR 突触
+// -----------------------------------------------------------------------------
+// 拓扑策略:
+//   - 每个运动神经元 (全局索引 motor_global_base + i, i ∈ [0, 5000))
+//     接收来自对应柱 (i / MOTOR_GROUP_SIZE) L5 层的 50 个突触
+//   - L5 层柱内偏移: COL_L4_SIZE_2E + COL_L23_SIZE_2E = 550 (200 个 L5 神经元)
+//   - 从该柱 L5 层 (200 个神经元) 随机选 50 个作为突触前神经元
+//   - 突触类型: 兴奋性 (AMPA + NMDA, receptor_flags = 0x03)
+//   - 初始权重: [0.3, 0.8] 均匀分布
+//   - 延迟: 1-3 步 (柱内延迟, 与 DELAY_INTRA_MIN/MAX 一致)
+//   CSR 布局:
+//   - row_ptr[i] = i × L5_TO_MOTOR_SYNAPSES_PER_NEURON  (每个运动神经元固定 50 入度)
+//   - col_idx[row_ptr[i] + k] = L5 突触前神经元索引
+//   总突触数 = N_MOTOR_NEURONS × L5_TO_MOTOR_SYNAPSES_PER_NEURON = 5000 × 50 = 250,000
+// -----------------------------------------------------------------------------
+int init_l5_to_motor_synapses(BioSynapse* d_l5_to_motor_synapses,
+                              float* d_l5_to_motor_weights,
+                              int* d_l5_to_motor_csr_row_ptr,
+                              int* d_l5_to_motor_csr_col_idx,
+                              uint32_t seed) {
+    // 简单的确定性 PRNG (与 init_synapses_host 一致, xorshift32)
+    uint32_t rng = seed == 0 ? 0x6D2B79F5u : seed;
+    auto next_rng = [&rng]() -> uint32_t {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        return rng;
+    };
+    auto randf = [&next_rng](float lo, float hi) -> float {
+        return lo + (hi - lo) * (next_rng() / 4294967296.0f);
+    };
+    auto randi = [&next_rng](int lo, int hi) -> int {  // [lo, hi)
+        return lo + static_cast<int>(next_rng() % static_cast<uint32_t>(hi - lo));
+    };
+
+    const int n_syn = N_MOTOR_NEURONS * L5_TO_MOTOR_SYNAPSES_PER_NEURON;  // 250,000
+
+    // Host 端构造
+    std::vector<BioSynapse> h_syn(n_syn);
+    std::vector<float>      h_w(n_syn);
+    std::vector<int>        h_row(N_MOTOR_NEURONS + 1);
+    std::vector<int>        h_col(n_syn);
+
+    // L5 层在柱内的偏移: COL_L4_SIZE_2E + COL_L23_SIZE_2E = 200 + 350 = 550
+    // L5 层大小: COL_L5_SIZE_2E = 200 (柱内 [550, 750))
+    const int l5_offset_in_col = COL_L4_SIZE_2E + COL_L23_SIZE_2E;
+    const int l5_size          = COL_L5_SIZE_2E;
+
+    // 运动神经元全局起始索引: N_ASSOCIATION_NEURONS_2E + N_PREFRONTAL_NEURONS = 55,000
+    const int motor_global_base = N_ASSOCIATION_NEURONS_2E + N_PREFRONTAL_NEURONS;
+
+    // CSR row_ptr: 每个运动神经元固定接收 L5_TO_MOTOR_SYNAPSES_PER_NEURON 个突触
+    h_row[0] = 0;
+    for (int i = 0; i < N_MOTOR_NEURONS; ++i) {
+        h_row[i + 1] = h_row[i] + L5_TO_MOTOR_SYNAPSES_PER_NEURON;
+    }
+
+    // 生成突触
+    for (int i = 0; i < N_MOTOR_NEURONS; ++i) {
+        // 运动神经元 i 对应的柱 (i / MOTOR_GROUP_SIZE = i / 100)
+        int col      = i / MOTOR_GROUP_SIZE;
+        int col_base = col * NEURONS_PER_COLUMN_2E;
+        int l5_base  = col_base + l5_offset_in_col;  // 该柱 L5 层基址
+
+        // 运动神经元全局索引 (用于 BioSynapse.post_idx)
+        int post_global = motor_global_base + i;
+
+        int start = h_row[i];
+        for (int k = 0; k < L5_TO_MOTOR_SYNAPSES_PER_NEURON; ++k) {
+            // 从该柱 L5 层 (200 个神经元) 随机选一个作为突触前神经元
+            int pre_local = randi(0, l5_size);
+            int pre       = l5_base + pre_local;
+
+            int idx = start + k;
+            h_col[idx] = pre;
+
+            // 权重 [0.3, 0.8] 均匀分布
+            float w = randf(0.3f, 0.8f);
+            h_w[idx] = w;
+
+            // 初始化 BioSynapse 字段 (兴奋性: AMPA + NMDA)
+            BioSynapse& s = h_syn[idx];
+            s.pre_idx       = pre;
+            s.post_idx      = post_global;
+            s.weight        = w;
+            // 延迟 1-3 步 (柱内延迟)
+            s.delay_steps   = static_cast<float>(randi(DELAY_INTRA_MIN, DELAY_INTRA_MAX + 1));
+            s.last_pre_spike  = -1000.0f;
+            s.last_post_spike = -1000.0f;
+            s.x_pre_trace     = 0.0f;
+            s.x_post_trace    = 0.0f;
+            s.nmda_conductance = 0.0f;
+            s.ampa_conductance = 0.0f;
+            s.ca_concentration = 0.0f;
+            s.resource        = 1.0f;
+            s.utilization     = STP_U_SE;             // 兴奋性基线利用率 U
+            s.eligibility     = 0.0f;
+            s.eligibility_slow = 0.0f;
+            s.scaling_factor = 1.0f;
+            s.camkii_autophosph = 0.0f;
+            s.da_receptor    = DA_RECEPTOR_INIT_EXC;  // 兴奋性突触偏向 D1
+            s.ach_receptor   = ACH_RECEPTOR_INIT;
+            s.receptor_flags = 0x03;                   // AMPA + NMDA (兴奋性)
+            set_ne_receptor(s, NE_RECEPTOR_INIT);
+            set_ht5_receptor(s, HT5_RECEPTOR_INIT);
+            s._pad = 0;
+        }
+    }
+
+    // 上传 GPU
+    CUDA_CHECK_2E(cudaMemcpy(d_l5_to_motor_synapses, h_syn.data(),
+                              n_syn * sizeof(BioSynapse),
+                              cudaMemcpyHostToDevice));
+    CUDA_CHECK_2E(cudaMemcpy(d_l5_to_motor_weights, h_w.data(),
+                              n_syn * sizeof(float),
+                              cudaMemcpyHostToDevice));
+    CUDA_CHECK_2E(cudaMemcpy(d_l5_to_motor_csr_row_ptr, h_row.data(),
+                              h_row.size() * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    CUDA_CHECK_2E(cudaMemcpy(d_l5_to_motor_csr_col_idx, h_col.data(),
+                              n_syn * sizeof(int),
+                              cudaMemcpyHostToDevice));
+
+    return n_syn;
+}
+
+// -----------------------------------------------------------------------------
 // Host: 初始化零缓冲 (调质, 输入电流, NMDA, etc.)
 // -----------------------------------------------------------------------------
 void init_buffers_zero(MemoryAllocator* alloc) {
@@ -577,7 +759,7 @@ void init_network(MemoryAllocator* alloc, uint32_t seed) {
 
     PersistentBuffers& b = alloc->buffers();
 
-    printf("[Stage2e P1] 初始化神经元 (55K AdEx 静息)...\n");
+    printf("[Stage2e P1] 初始化神经元 (60K AdEx 静息)...\n");
     init_neurons(b.d_neurons);
 
     printf("[Stage2e P1] 初始化突触拓扑 + 延迟 + STP + 调质受体 + PSW...\n");
@@ -591,6 +773,30 @@ void init_network(MemoryAllocator* alloc, uint32_t seed) {
 
     printf("[Stage2e P1] 初始化缓冲为零...\n");
     init_buffers_zero(alloc);
+
+    // -----------------------------------------------------------------
+    // 语言运动皮层初始化 (在现有网络初始化之后)
+    // -----------------------------------------------------------------
+    printf("[Stage2e P1] 初始化运动皮层神经元 (5K AdEx 静息, region=MOTOR)...\n");
+    init_motor_neurons(b.d_motor_neurons);
+
+    printf("[Stage2e P1] 生成 L5 → 运动皮层稀疏 CSR 突触 (250K 突触)...\n");
+    int n_l5_motor_syn = init_l5_to_motor_synapses(b.d_l5_to_motor_synapses,
+                                                   b.d_l5_to_motor_weights,
+                                                   b.d_l5_to_motor_csr_row_ptr,
+                                                   b.d_l5_to_motor_csr_col_idx,
+                                                   seed);
+    const int expected_l5_motor_syn = N_MOTOR_NEURONS * L5_TO_MOTOR_SYNAPSES_PER_NEURON;
+    if (n_l5_motor_syn != expected_l5_motor_syn) {
+        fprintf(stderr, "[Stage2e P1 WARN] L5→Motor 突触数 %d != 目标 %d\n",
+                n_l5_motor_syn, expected_l5_motor_syn);
+    }
+
+    // 零初始化解码权重矩阵 (虽然 alloc 已清零, 显式 memset 强调语义: 解码器从零权重起步)
+    printf("[Stage2e P1] 零初始化解码权重矩阵 (60K × 256 = %.2f MB)...\n",
+           (size_t)N_TOTAL_NEURONS_2E * 256 * sizeof(float) / (1024.0 * 1024.0));
+    CUDA_CHECK_2E(cudaMemset(b.d_decode_weights, 0,
+                              (size_t)N_TOTAL_NEURONS_2E * 256 * sizeof(float)));
 
     printf("[Stage2e P1] 网络初始化完成\n");
 }

@@ -759,4 +759,87 @@ void set_e0_ablation(bool enable) {
     }
 }
 
+// =============================================================================
+// Task 7: L5 → 运动皮层突触传递 kernel
+// =============================================================================
+//   每个 thread 处理一个运动神经元 i ∈ [0, N_MOTOR_NEURONS)
+//   扫描其 50 个入度突触 (CSR row [row_ptr[i], row_ptr[i+1]))
+//   累加发放突触前神经元的 weight × resource 到 motor_input_current[i]
+//
+// 设计要点:
+//   - 突触前神经元索引 pre_idx ∈ [0, 55000) (联合皮层 L5 层)
+//     spike 状态从主网络 d_spike_flags[pre_idx] 读取
+//   - 突触后为运动皮层神经元 (独立缓冲 d_motor_neurons), 不在主 d_neurons 中
+//   - 简化受体模型: 电流 = weight × resource (与 delay_dispatch_kernel 一致)
+//     不更新 STP (resource/utilization 保持初始值, 让 L5→Motor 通路稳态传递)
+//   - 写入模式: 直接赋值 (motor_input_current[i] = current), 隐式清零旧值
+// =============================================================================
+__global__ void l5_to_motor_synapse_kernel(
+    float* __restrict__ motor_input_current,     // [N_MOTOR_NEURONS] 输出
+    const bool* __restrict__ spike_flags,         // [N_TOTAL_NEURONS_2E] 主网络脉冲标志
+    const BioSynapse* __restrict__ synapses,      // [250K] L5→Motor 突触
+    const int* __restrict__ csr_row_ptr,          // [N_MOTOR_NEURONS + 1]
+    int n_motor_neurons)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_motor_neurons) return;
+
+    int row_start = csr_row_ptr[i];
+    int row_end   = csr_row_ptr[i + 1];
+
+    float current = 0.0f;
+    for (int k = row_start; k < row_end; ++k) {
+        const BioSynapse& s = synapses[k];
+        int pre = s.pre_idx;
+        // 防御: pre_idx 应在 [0, N_ASSOCIATION_NEURONS_2E + N_PREFRONTAL_NEURONS) = [0, 55000)
+        if (pre >= 0 && pre < N_TOTAL_NEURONS_2E && spike_flags[pre]) {
+            // 简化受体模型: 电流 = weight × resource (无 STP 更新)
+            current += s.weight * s.resource;
+        }
+    }
+    // 直接赋值 (隐式清零, 无需 memset 预清)
+    motor_input_current[i] = current;
+}
+
+// -----------------------------------------------------------------------------
+// 静态 device 缓冲: 运动皮层输入电流 (N_MOTOR_NEURONS × 4B = 20KB)
+// 懒分配, 程序生命周期内复用 (与 neuron_kernels.cu 的 d_delay_counters 模式一致)
+// -----------------------------------------------------------------------------
+namespace {
+float* d_motor_input_current = nullptr;
+
+inline void ensure_motor_input_current() {
+    if (d_motor_input_current == nullptr) {
+        CUDA_CHECK_2E(cudaMalloc(&d_motor_input_current,
+                                  N_MOTOR_NEURONS * sizeof(float)));
+        CUDA_CHECK_2E(cudaMemset(d_motor_input_current, 0,
+                                  N_MOTOR_NEURONS * sizeof(float)));
+    }
+}
+} // anonymous namespace
+
+// Task 7 host launcher: L5 → 运动皮层突触传递
+void launch_l5_to_motor_synapse(MemoryAllocator* alloc) {
+    PersistentBuffers& b = alloc->buffers();
+    // 防御: L5→Motor 突触未分配时直接跳过 (避免 nullptr deref)
+    if (!b.d_l5_to_motor_synapses || !b.d_l5_to_motor_csr_row_ptr || !b.d_spike_flags) {
+        return;
+    }
+    ensure_motor_input_current();
+
+    int blocks = (N_MOTOR_NEURONS + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    l5_to_motor_synapse_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        d_motor_input_current,
+        b.d_spike_flags,
+        b.d_l5_to_motor_synapses,
+        b.d_l5_to_motor_csr_row_ptr,
+        N_MOTOR_NEURONS);
+    CUDA_CHECK_LAST_2E();
+}
+
+// 获取运动皮层输入电流缓冲指针 (供 launch_motor_adex 读取)
+float* get_motor_input_current() {
+    return d_motor_input_current;
+}
+
 } // namespace stage2e

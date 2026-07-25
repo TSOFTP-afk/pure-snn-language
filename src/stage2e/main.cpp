@@ -76,6 +76,10 @@ static void print_experiment_metadata(FILE* fp, const char* prefix,
     emit_run_param(fp, prefix, "checkpoint_interval", "%d", config.checkpoint_interval);
     emit_run_param(fp, prefix, "keep_checkpoints", "%d", config.keep_checkpoints);
     emit_run_param(fp, prefix, "resume_path", "%s", config.resume_path.c_str());
+    // Task 10: 评估参数
+    emit_run_param(fp, prefix, "decode_lr", "%.6f", config.decode_lr);
+    emit_run_param(fp, prefix, "eval_mode", "%d", config.eval_mode ? 1 : 0);
+    emit_run_param(fp, prefix, "eval_text_path", "%s", config.eval_text_path.c_str());
     emit_run_param(fp, prefix, "csv_enabled", "%d", csv_enabled ? 1 : 0);
     emit_run_param(fp, prefix, "csv_path", "%s", csv_path ? csv_path : "");
     emit_run_param(fp, prefix, "log_interval", "%d", LOG_INTERVAL_2E);
@@ -243,6 +247,15 @@ static void print_experiment_metadata(FILE* fp, const char* prefix,
         emit_run_param(fp, prefix, "dev_phase_myeline_factor", "%d:%.6f", i, phase_table.phases[i].myeline_factor);
         emit_run_param(fp, prefix, "dev_phase_end_step", "%d:%d", i, phase_table.phases[i].end_step);
     }
+    // Task 8.4: 在线解码 (语言运动皮层) 参数
+    emit_run_param(fp, prefix, "n_motor_neurons", "%d", N_MOTOR_NEURONS);
+    emit_run_param(fp, prefix, "n_motor_groups", "%d", N_MOTOR_GROUPS);
+    emit_run_param(fp, prefix, "motor_group_size", "%d", MOTOR_GROUP_SIZE);
+    emit_run_param(fp, prefix, "l5_to_motor_synapses_per_neuron", "%d", L5_TO_MOTOR_SYNAPSES_PER_NEURON);
+    emit_run_param(fp, prefix, "decode_learning_rate", "%.6f", DECODE_LEARNING_RATE);
+    emit_run_param(fp, prefix, "perplexity_log_interval", "%d", PERPLEXITY_LOG_INTERVAL);
+    emit_run_param(fp, prefix, "prediction_delay_steps", "%d", PREDICTION_DELAY_STEPS);
+    emit_run_param(fp, prefix, "decode_baseline_perplexity", "%.6f", 5.5451774f);  // ln(256)
     emit_run_param(fp, prefix, "chi2_df", "%d", 255);
     emit_run_param(fp, prefix, "chi2_p_threshold", "%.6f", 0.05);
     emit_run_param(fp, prefix, "chi2_critical", "%.6f", 293.2);
@@ -634,10 +647,18 @@ int main(int argc, char** argv) {
     // --- 3.5 加载真实文本语料 (LCCC 子集) ---
     // 替代 step%256 循环注入, 改为 UTF-8 字节流注入
     // 生物学意义: 让网络学习真实中文文本的字节级统计规律
+    // Task 10: 评估模式下若指定 --eval-text, 加载 held-out 评估文本替代训练语料
     {
         size_t loaded = 0;
         if (!config.synthetic_input) {
-            loaded = stage2e::load_text_corpus(config.text_path.c_str());
+            // eval_mode + eval_text_path 非空: 加载 held-out 评估文本
+            // 否则: 加载训练语料
+            const char* corpus_path = config.text_path.c_str();
+            if (config.eval_mode && !config.eval_text_path.empty()) {
+                corpus_path = config.eval_text_path.c_str();
+                printf("[P1] 评估模式: 加载 held-out 评估文本: %s\n", corpus_path);
+            }
+            loaded = stage2e::load_text_corpus(corpus_path);
         }
         if (loaded > 0) {
             printf("[P1] 已加载 LCCC 真实文本语料: %zu 字节\n", loaded);
@@ -645,7 +666,10 @@ int main(int argc, char** argv) {
         } else if (config.synthetic_input) {
             printf("[P1] 输入模式: 显式 synthetic 0..255 循环\n\n");
         } else {
-            fprintf(stderr, "[P1 FAIL] 无法加载语料: %s\n", config.text_path.c_str());
+            fprintf(stderr, "[P1 FAIL] 无法加载语料: %s\n",
+                    config.eval_mode && !config.eval_text_path.empty()
+                        ? config.eval_text_path.c_str()
+                        : config.text_path.c_str());
             allocator.free_all();
             return 1;
         }
@@ -661,6 +685,17 @@ int main(int argc, char** argv) {
         stage2e::set_e0_ablation(true);
         printf("  *** E0 scheduler.e0_ablation = true ***\n\n");
     }
+
+    // Task 10: 评估模式 + 解码学习率配置
+    // eval_mode=true: decode_step 仅前向预测, 不更新 W_decode (冻结权重)
+    // decode_lr: 传递给 scheduler (kernel 暂用编译常量, 此处供元数据记录)
+    scheduler.decode_update_weights = !config.eval_mode;
+    scheduler.decode_lr = config.decode_lr;
+    if (config.eval_mode) {
+        printf("  *** 评估模式: decode_step 不更新 W_decode (仅前向预测) ***\n");
+        printf("  *** scheduler.decode_update_weights = false ***\n\n");
+    }
+    printf("  [Task 10] decode_lr = %.6f (config.decode_lr)\n\n", config.decode_lr);
 
     int start_step = 0;
     if (!config.resume_path.empty()) {
@@ -1572,6 +1607,19 @@ int main(int argc, char** argv) {
     emit_final_metric(stdout, "gate_mean", "%.4f", scheduler.gate_mean());
     emit_final_metric(stdout, "gate_open_ratio", "%.4f", scheduler.gate_open_ratio());
     emit_final_metric(stdout, "criterion_gate", "%d", gate_ok ? 1 : 0);
+    // Task 8.5: 在线解码 (语言运动皮层) 最终指标
+    // perplexity = exp(mean_cross_entropy_loss), 随机基线 = ln(256) ≈ 5.545
+    // 目标: 100K 步后 perplexity < 5.55 (学到字节级统计规律), 理想 < 4.0
+    emit_final_metric(stdout, "final_perplexity", "%.6f", scheduler.get_decode_perplexity());
+    emit_final_metric(stdout, "final_decode_acc", "%.6f", scheduler.get_decode_accuracy());
+    emit_final_metric(stdout, "decode_avg_loss", "%.9f", scheduler.get_decode_avg_loss());
+    emit_final_metric(stdout, "decode_correct_count", "%d", scheduler.get_decode_correct_count());
+    emit_final_metric(stdout, "decode_total_count", "%d", scheduler.get_decode_total_count());
+    emit_final_metric(stdout, "last_decode_loss", "%.9f", scheduler.get_last_decode_loss());
+    emit_final_metric(stdout, "last_predicted_byte", "%d", scheduler.get_last_predicted_byte());
+    emit_final_metric(stdout, "decode_baseline_perplexity", "%.6f", 5.5451774f);  // ln(256)
+    // Task 2: PCA 集成 — 增量更新次数 (CPU 端 Oja's rule 执行次数)
+    emit_final_metric(stdout, "pca_update_count", "%d", scheduler.pca_update_count());
     printf("FINAL_METRICS_END\n");
 
     // --- 8. 清理 ---

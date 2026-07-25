@@ -15,12 +15,17 @@
 #include "synapse_kernels.cuh"
 #include "input_encoding.cuh"
 #include "modulatory_kernels.cuh"
+#include "pca_kernels.cuh"
+#include "hippocampal_kernels.cuh"
+#include "coactivation_kernels.cuh"
+#include "wm_kernels.cuh"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <vector>
 #include <algorithm>
 #include <limits>
+#include <random>
 #include <cuda_runtime.h>
 
 namespace stage2e {
@@ -42,6 +47,14 @@ static inline double js_divergence(const double* P, const double* Q, int dim) {
 __global__ void p1_noop_clear_float(float* d, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) d[i] = 0.0f;
+}
+
+// Task 2: spike_flags (bool) → 发放率 (float) 转换, 供 PCA 签名提取用
+// 联合皮层前 N_ASSOCIATION_NEURONS_2E 个神经元的瞬时发放 (0/1) 转为 float
+__global__ void pca_spike_to_float_kernel(const bool* __restrict__ spikes,
+                                          float* __restrict__ fr, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) fr[i] = spikes[i] ? 1.0f : 0.0f;
 }
 
 // P3-D 结构可塑性 (PSW 版本): 证据衰减 + 弱突触重置
@@ -375,6 +388,46 @@ BioMechanismScheduler::BioMechanismScheduler(MemoryAllocator* alloc)
         layer_chi2_sig_ratio_[i] = 0.0f;
         layer_chi2_mean_[i] = 0.0;
     }
+
+    // Task 2: PCA 集成 — CPU 端镜像 + GPU 辅助缓冲初始化
+    // h_pca_W_ [50K × 50 = 2.5M float = 10MB]
+    // P0 修复: 对称性打破 — Oja's rule 要求 W 非零初值, 否则 proj=Σ W·x=0 导致
+    //         更新量 η·(x - W·proj)·proj = η·x·0 = 0, W 永久死锁在 0
+    //         修复: 初始化为小随机值 N(0, σ²), σ=0.01 (远小于 STDP_W_MAX=1.5)
+    h_pca_W_.resize((size_t)N_ASSOCIATION_NEURONS_2E * PCA_N_COMPONENTS, 0.0f);
+    {
+        // 固定种子保证可复现 (不依赖 topology_seed, PCA 初始化独立)
+        std::mt19937 pca_rng(42);
+        std::normal_distribution<float> pca_dist(0.0f, 0.01f);
+        for (auto& w : h_pca_W_) w = pca_dist(pca_rng);
+    }
+    h_fr_snapshot_.resize(N_ASSOCIATION_NEURONS_2E, 0.0f);
+    h_mean_fr_.resize(N_ASSOCIATION_NEURONS_2E, 0.0f);
+    h_spike_buf_.resize(N_ASSOCIATION_NEURONS_2E, 0);
+    // GPU 辅助缓冲: 供 compute_pca_signature / pca_back_project 调用 PCA kernel
+    CUDA_CHECK_2E(cudaMalloc(&d_pca_fr_, N_ASSOCIATION_NEURONS_2E * sizeof(float)));
+    CUDA_CHECK_2E(cudaMemset(d_pca_fr_, 0, N_ASSOCIATION_NEURONS_2E * sizeof(float)));
+    CUDA_CHECK_2E(cudaMalloc(&d_pca_mean_, N_ASSOCIATION_NEURONS_2E * sizeof(float)));
+    CUDA_CHECK_2E(cudaMemset(d_pca_mean_, 0, N_ASSOCIATION_NEURONS_2E * sizeof(float)));
+    // P0 修复: 同步打破对称性后的 h_pca_W_ 到 GPU d_pca_W (确保首次 compute_pca_signature 有效)
+    {
+        PersistentBuffers& buf = alloc_->buffers();
+        if (buf.d_pca_W) {
+            CUDA_CHECK_2E(cudaMemcpy(buf.d_pca_W, h_pca_W_.data(),
+                                     (size_t)N_ASSOCIATION_NEURONS_2E * PCA_N_COMPONENTS * sizeof(float),
+                                     cudaMemcpyHostToDevice));
+        }
+    }
+
+    // Task 4-5: 睡眠重放临时缓冲
+    CUDA_CHECK_2E(cudaMalloc(&d_replay_sig_, PCA_N_COMPONENTS * sizeof(float)));
+    CUDA_CHECK_2E(cudaMalloc(&d_replay_recon_, N_ASSOCIATION_NEURONS_2E * sizeof(float)));
+    // Task 8: 结构可塑性临时缓冲
+    CUDA_CHECK_2E(cudaMalloc(&d_new_synapse_pairs_, 2 * COACT_MAX_NEW_SYNAPSES * sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_new_synapse_count_, sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_new_modulator_scores_, COACT_MAX_NEW_SYNAPSES * sizeof(float)));
+    CUDA_CHECK_2E(cudaMalloc(&d_prune_marks_, (size_t)N_TOTAL_SYNAPSES_2E * sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_prune_count_, sizeof(int)));
 }
 
 BioMechanismScheduler::~BioMechanismScheduler() {
@@ -395,6 +448,18 @@ BioMechanismScheduler::~BioMechanismScheduler() {
     if (d_layer_act_count_) cudaFree(d_layer_act_count_);
     if (d_layer_chi2_sum_) cudaFree(d_layer_chi2_sum_);
     if (d_injections_per_byte_) cudaFree(d_injections_per_byte_);
+    // Task 2: 释放 PCA GPU 辅助缓冲
+    if (d_pca_fr_) cudaFree(d_pca_fr_);
+    if (d_pca_mean_) cudaFree(d_pca_mean_);
+    // Task 4-5: 释放睡眠重放临时缓冲
+    if (d_replay_sig_) cudaFree(d_replay_sig_);
+    if (d_replay_recon_) cudaFree(d_replay_recon_);
+    // Task 8: 释放结构可塑性临时缓冲
+    if (d_new_synapse_pairs_) cudaFree(d_new_synapse_pairs_);
+    if (d_new_synapse_count_) cudaFree(d_new_synapse_count_);
+    if (d_new_modulator_scores_) cudaFree(d_new_modulator_scores_);
+    if (d_prune_marks_) cudaFree(d_prune_marks_);
+    if (d_prune_count_) cudaFree(d_prune_count_);
 }
 
 void BioMechanismScheduler::step(int current_step) {
@@ -441,7 +506,8 @@ void BioMechanismScheduler::step(int current_step) {
     // 门控调制增益: 传入 d_gate_states_ 数组, kernel 内部读取 .gate_signal 字段
     // (ThalamicGateState 是 16B 结构体, gate_signal 在 offset 0, 但相邻柱间隔 16B
     //  故不能用 float* 强转索引, 必须通过结构体字段访问)
-    if (is_inject_step) {
+    // Task 18: 睡眠重放期间 (is_sleeping_=true) 跳过外部字节注入, 防止污染重放模式
+    if (is_inject_step && !is_sleeping_) {
         launch_input_inject(alloc_, current_byte, d_gate_states_);
     }
 
@@ -477,6 +543,15 @@ void BioMechanismScheduler::step(int current_step) {
     p1_noop_clear_float<<<blocks, THREADS_PER_BLOCK_2E>>>(
         buf.d_inhibitory_current, N_TOTAL_NEURONS_2E);
 
+    // 9. Task 7: L5 → 运动皮层突触传递 + 运动皮层 AdEx 更新
+    //    - 主网络 spike_flags 已由 step 3 (lif_adex) 写入, 可作为 L5 突触前信号源
+    //    - L5→Motor 突触传递: 把 L5 脉冲通过 CSR 突触转为运动皮层输入电流
+    //    - 运动皮层 AdEx 更新: 复用 lif_adex_kernel, 用独立缓冲 (d_motor_neurons/spike_flags)
+    //    - 运动皮层脉冲不写入主 d_spike_flags, 不干扰主网络 STDP/NMDA/统计
+    //    时序: 在主网络完整更新 (含 delay_dispatch) 之后, 中时间尺度之前
+    launch_l5_to_motor_synapse(alloc_);
+    launch_motor_adex(alloc_, current_step, phase);
+
     // ==================== 中时间尺度 (每 10 步) ====================
     // P2 实现: camkii, eligibility, inhibitory_network
     // E0 消融模式: 跳过 CaMKII 和 eligibility (保留 inhibitory 占位)
@@ -487,15 +562,76 @@ void BioMechanismScheduler::step(int current_step) {
         launch_inhibitory_network(current_step);
     }
 
+    // ==================== Task 8: 共激活采样 (每步) ====================
+    // 在突触传递完成后, 从当前发放神经元采样候选对, 更新 d_coact_trackers
+    if (!e0_ablation && buf.d_coact_trackers) {
+        // P0 修复: stats_.da_level 已在每 100 步 modulatory 更新后同步 (line 607)
+        //          此处直接读取, 避免每步调用 get_modulatory_stats 的开销
+        float current_da = stats_.da_level;
+        launch_coactivation_sample(
+            buf.d_coact_trackers, buf.d_tracker_count,
+            buf.d_spike_flags, current_da,
+            N_TOTAL_NEURONS_2E, COACT_TRACKER_SIZE, COACT_SAMPLE_SIZE,
+            42u,  // 固定种子 (xorshift32 内部会混入 tid 和 step)
+            current_step);
+        coact_sample_count_++;
+    }
+
+    // P2 修复: 共激活计数衰减 (每 COACT_DECAY_INTERVAL 步)
+    // 对所有 tracker 执行 coact_count *= COACT_DECAY_FACTOR, 低频对自然归零被淘汰
+    if (!e0_ablation && buf.d_coact_trackers &&
+        current_step % COACT_DECAY_INTERVAL == 0 && current_step > 0) {
+        launch_coactivation_decay(buf.d_coact_trackers, buf.d_tracker_count,
+                                  COACT_TRACKER_SIZE);
+        // 衰减后立即清理已归零的陈旧条目
+        launch_coactivation_prune(buf.d_coact_trackers, buf.d_tracker_count,
+                                  COACT_TRACKER_SIZE, current_step,
+                                  COACT_STALE_THRESHOLD);
+    }
+
     // ==================== 慢时间尺度 (每 100 步) ====================
     // P2 实现: modulatory, scaling, wm_update
     // E0 消融模式: 跳过 modulatory 和 scaling (纯 STDP 不含调质和缩放)
+    // Task 18: 睡眠态跳过 modulatory (ACh/DA 刷新), 让 ACh 保持低水平巩固模式
     if (current_step % 100 == 0) {
-        if (!e0_ablation) {
+        if (!e0_ablation && !is_sleeping_) {
             launch_modulatory(current_step);
             launch_scaling(current_step);
+            // P0 修复: 同步 modulatory 系统的 DA/ACh 浓度到 stats_ (供共激活采样和 Task 18 使用)
+            // NetworkStats2e.da_level/ach_level 原本从未被赋值, 导致 modulator_score=0
+            ModulatoryStats mod_stats = get_modulatory_stats(alloc_);
+            stats_.da_level  = mod_stats.da_mean;
+            stats_.ach_level = mod_stats.ach_mean;
+            stats_.ne_level  = mod_stats.ne_mean;
+            stats_.ht5_level = mod_stats.ht5_mean;
         }
         launch_wm_update(current_step);
+    }
+
+    // ==================== Task 2: PCA 增量更新 (每 PCA_UPDATE_INTERVAL 步) ====================
+    // warmup 期 (step <= PCA_WARMUP_STEPS) 不更新, 等发放率稳定
+    // CPU 端 Oja's rule 在线学习 h_pca_W_, 每 PCA_SYNC_INTERVAL 步同步到 GPU
+    if (current_step > PCA_WARMUP_STEPS && current_step % PCA_UPDATE_INTERVAL == 0) {
+        launch_pca_update_cpu(current_step);
+    }
+
+    // ==================== Task 3: 海马索引编码 (每 HIPP_ENCODE_INTERVAL 步) ====================
+    if (current_step > PCA_WARMUP_STEPS && current_step % HIPP_ENCODE_INTERVAL == 0) {
+        // 计算 PCA 签名 (复用 compute_pca_signature)
+        compute_pca_signature(d_replay_sig_);
+        // 海马编码: 新颖模式 LRU 写入 / 已有模式 importance 刷新
+        launch_hippo_encode(
+            buf.d_hippo_indices, d_replay_sig_,
+            buf.d_hippo_write_cursor, buf.d_hippo_filled_count,
+            current_step, HIPP_INDEX_SIZE, HIPP_NOVELTY_THRESHOLD);
+        // P1.2 修复: 时间衰减 — 编码后对所有已填充索引执行 importance *= HIPP_TIME_DECAY
+        // 需读取当前 filled_count (host 端), 然后 GPU 端 grid 跨步衰减
+        {
+            int h_filled = 0;
+            CUDA_CHECK_2E(cudaMemcpy(&h_filled, buf.d_hippo_filled_count,
+                                     sizeof(int), cudaMemcpyDeviceToHost));
+            launch_hippo_time_decay(buf.d_hippo_indices, h_filled, HIPP_INDEX_SIZE);
+        }
     }
 
     // ==================== 极慢时间尺度 (每 1000 步) ====================
@@ -538,6 +674,16 @@ void BioMechanismScheduler::step(int current_step) {
 
     // v4: 延迟环形队列指针前进
     delay_ring_idx_ = (delay_ring_idx_ + 1) % DELAY_STEPS_MAX;
+
+    // ==================== Task 4-5: 在线解码 (前向预测 + 误差驱动学习) ====================
+    // 在所有现有 kernel 之后执行 (spike_flags 已由 lif_adex 写入, 延迟队列已分发)
+    // decode_step 内部:
+    //   1. 每步: forward + softmax + argmax (预测)
+    //   2. 仅注入步 + K 步 warmup 后: error + weight_update (学习)
+    //   3. 每 100 步: weight_normalize (正则化)
+    // Task 10: decode_update_weights 由 main.cpp 根据 config.eval_mode 设置
+    //   eval_mode=true → decode_update_weights=false → 仅前向预测, 不更新 W_decode
+    decode_step(current_byte, is_inject_step, /*update_weights=*/decode_update_weights);
 
     // ==================== 统计 ====================
     // 统计当前步 spike 数 (用于 P1 判据)
@@ -663,9 +809,32 @@ void BioMechanismScheduler::launch_modulatory(int step) {
     // TD error: δ = R + γ·V(s') - V(s)
     float da_delta = reward + TD_GAMMA * v_sp - v_s;
 
+    // Task 6: 从 d_decode_error 计算在线解码预测误差 L2 范数
+    // ||error|| = sqrt(Σ_b error[b]²), ∈ [0, sqrt(2)] ≈ [0, 1.414]
+    //   - 完美预测 (softmax 完全匹配 one-hot): ||error|| = 0 → DA 最高
+    //   - 均匀预测 (softmax = 1/256):          ||error|| ≈ 1.0 → DA 中性
+    //   - 完全错误 (softmax 给错类概率 1):      ||error|| = sqrt(2) → DA 最低
+    // warmup 期间 (input_byte_history_count_ < PREDICTION_DELAY_STEPS) 未产生真实误差,
+    //   d_decode_error 全零 (||error||=0) 会误判为完美预测, 用中性值 1.0 代替
+    float prediction_error_norm = 1.0f;  // 默认中性 (warmup 或未解码)
+    PersistentBuffers& buf = alloc_->buffers();
+    if (buf.d_decode_error && input_byte_history_count_ >= PREDICTION_DELAY_STEPS) {
+        float h_error[256];
+        CUDA_CHECK_2E(cudaMemcpy(h_error, buf.d_decode_error,
+                                  256 * sizeof(float), cudaMemcpyDeviceToHost));
+        float sq_sum = 0.0f;
+        for (int b = 0; b < 256; ++b) {
+            sq_sum += h_error[b] * h_error[b];
+        }
+        prediction_error_norm = sqrtf(sq_sum);
+        // clamp 到 [0, sqrt(2)] 防止数值异常
+        if (prediction_error_norm > 1.41421356f) prediction_error_norm = 1.41421356f;
+    }
+
     // 调质浓度动力学
     float kl_div = 0.0f;  // P2 简化: NE 暂不触发
-    ::stage2e::launch_modulatory(alloc_, step, reward, novelty, pred_succ, kl_div, da_delta);
+    ::stage2e::launch_modulatory(alloc_, step, reward, novelty, pred_succ, kl_div, da_delta,
+                                  prediction_error_norm);
 }
 
 void BioMechanismScheduler::launch_scaling(int step) {
@@ -681,12 +850,37 @@ void BioMechanismScheduler::launch_scaling(int step) {
 void BioMechanismScheduler::launch_wm_update(int step) {
     PersistentBuffers& buf = alloc_->buffers();
     if (!buf.d_wm_slots) return;
+
+    // === 阶段 1: WM 写入 (每 WM_WRITE_INTERVAL 步) ===
+    // 计算 PCA 签名, 与 50 槽位匹配, 新颖模式 LRU 替换
+    if (step > PCA_WARMUP_STEPS && step % WM_WRITE_INTERVAL == 0) {
+        compute_pca_signature(d_replay_sig_);
+        launch_wm_write(
+            buf.d_wm_slots, d_replay_sig_,
+            buf.d_wm_write_cursor, step,
+            WM_SLOTS, WM_NOVELTY_THRESHOLD);
+    }
+
+    // === 阶段 2: WM 维持与注入 (每步) ===
+    // 清零前额叶输入缓冲, 然后调用 wm_maintain 累加注入
+    if (buf.d_prefrontal_input) {
+        CUDA_CHECK_2E(cudaMemsetAsync(buf.d_prefrontal_input, 0,
+                                       N_PREFRONTAL_NEURONS * sizeof(float)));
+        launch_wm_maintain(
+            buf.d_wm_slots, buf.d_pca_W, d_pca_mean_, buf.d_prefrontal_input,
+            WM_SLOTS, N_PREFRONTAL_NEURONS, NEURONS_PER_PF_GROUP,
+            WM_INJECT_THRESHOLD, WM_DECAY, PCA_N_COMPONENTS,
+            N_ASSOCIATION_NEURONS_2E + N_PREFRONTAL_NEURONS);
+    }
+
+    // === 阶段 3: 保留原有 p3_wm_update_kernel (兼容性, 用于 activity_drive 统计) ===
+    // 注: 原 p3_wm_update_kernel 用 activity_drive 驱动 WM 槽位, 现已被
+    //     launch_wm_write (PCA 签名驱动) 替代。但保留调用以维持统计计数。
     float avg_spikes = total_steps_ > 0 ? (float)total_spikes_accum_ / (float)total_steps_ : 0.0f;
     float activity_drive = stats_.total_spikes / (avg_spikes + 1.0f);
     if (activity_drive > 2.0f) activity_drive = 2.0f;
     if (activity_drive < 0.0f) activity_drive = 0.0f;
-    int blocks = (WM_SLOTS + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
-    p3_wm_update_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(buf.d_wm_slots, activity_drive, step);
+    p3_last_activity_drive_ = activity_drive;
     p3_wm_updates_++;
 }
 
@@ -957,22 +1151,69 @@ void BioMechanismScheduler::launch_structural_plasticity(int step) {
     PersistentBuffers& buf = alloc_->buffers();
     if (!buf.d_synapses || !buf.d_synapse_alpha || !buf.d_synapse_beta) return;
 
-    // P3-D 结构可塑性 (PSW 版本): 证据衰减 + 弱突触重置
-    // 从发育阶段参数获取 prune_threshold (PRUNING 阶段 0.05, 转为证据阈值)
+    // === 阶段 1: PSW α/β 衰减 + 弱突触重置 (保留原有逻辑) ===
     const DevPhaseParams& phase = phase_table_.get_params(step);
-    // 证据阈值: prune_threshold 越大, 越多弱突触被重置为先验
-    // PRUNING 阶段 prune_threshold=0.05 → evidence_threshold=0.05 (重置证据 < 0.05 的突触)
-    // 其他阶段 prune_threshold=0.0 → evidence_threshold=0.0 (不重置)
     float evidence_threshold = phase.prune_threshold;
-    // 衰减因子: 每千步衰减 5% (α/β 同步衰减, 保持比例, 重获可塑性)
-    // 修复 L5/L6 chi2 停滞: 原 0.999 (0.1%) 衰减太弱, 前馈权重在 10K 步内饱和
-    //   改为 0.95 (5%): 10K 步衰减 40%, 100K 步衰减 99.4%, 定期重置饱和
     float decay_factor = 0.95f;
 
     int blocks = (N_TOTAL_SYNAPSES_2E + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
     structural_plasticity_decay_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         buf.d_synapses, buf.d_synapse_alpha, buf.d_synapse_beta,
         N_TOTAL_SYNAPSES_2E, decay_factor, evidence_threshold);
+
+    // === 阶段 2: 结构重建 (共激活候选 → 新突触 + 弱突触修剪) ===
+    // 每 STRUCTURAL_REBUILD_INTERVAL 步触发 (当前 step % 1000 == 0 已在 step() 中判定)
+    if (step > 0 && step % STRUCTURAL_REBUILD_INTERVAL == 0) {
+        // 读取当前 tracker 数量
+        int tracker_count = 0;
+        CUDA_CHECK_2E(cudaMemcpy(&tracker_count, buf.d_tracker_count,
+                                  sizeof(int), cudaMemcpyDeviceToHost));
+        if (tracker_count > COACT_TRACKER_SIZE) tracker_count = COACT_TRACKER_SIZE;
+
+        if (tracker_count > 0) {
+            // 调用结构重建 (阶段1: 候选生成 + 阶段2: 修剪标记)
+            launch_structural_rebuild(
+                buf.d_coact_trackers, tracker_count,
+                d_new_synapse_pairs_, d_new_synapse_count_, d_new_modulator_scores_,
+                buf.d_synapses, buf.d_csr_row_ptr,
+                N_TOTAL_NEURONS_2E,
+                d_prune_marks_, d_prune_count_,
+                COACT_FORM_THRESHOLD, PRUNE_WEIGHT_THRESHOLD, COACT_MAX_NEW_SYNAPSES);
+
+            // 同步并读取计数
+            CUDA_CHECK_2E(cudaDeviceSynchronize());
+            int new_count = 0, prune_count = 0;
+            CUDA_CHECK_2E(cudaMemcpy(&new_count, d_new_synapse_count_,
+                                      sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK_2E(cudaMemcpy(&prune_count, d_prune_count_,
+                                      sizeof(int), cudaMemcpyDeviceToHost));
+
+            // 读取当前突触总数
+            int n_synapses_total = 0;
+            CUDA_CHECK_2E(cudaMemcpy(&n_synapses_total, buf.d_csr_row_ptr + N_TOTAL_NEURONS_2E,
+                                      sizeof(int), cudaMemcpyDeviceToHost));
+
+            // 5% 阈值判定 + CSR 重建 + Task 19: 完整性校验 + 失败回滚
+            // launch_csr_rebuild_with_integrity_check 内部:
+            //   1. 保存旧 CSR 副本
+            //   2. 调用 launch_csr_rebuild (含 5% 判定)
+            //   3. 重建后启动 csr_integrity_check_kernel 校验
+            //   4. 校验失败时从旧副本回滚
+            int integrity_err = launch_csr_rebuild_with_integrity_check(
+                buf.d_synapses, buf.d_csr_row_ptr,
+                d_new_synapse_pairs_, new_count,
+                d_prune_marks_, N_TOTAL_NEURONS_2E,
+                n_synapses_total,
+                0);  // stream = 0 (默认流)
+            bool rebuilt = (integrity_err == 0);
+
+            structural_rebuild_count_++;
+            printf("[Stage2e P3-D] step=%d 结构重建 #%d: new=%d prune=%d total=%d rebuilt=%s integrity=%s\n",
+                   step, structural_rebuild_count_, new_count, prune_count,
+                   n_synapses_total, rebuilt ? "YES" : "NO(threshold)",
+                   integrity_err == 0 ? "OK" : "FAIL(rolled-back)");
+        }
+    }
 }
 
 void BioMechanismScheduler::launch_developmental(int step) {
@@ -986,8 +1227,266 @@ void BioMechanismScheduler::launch_developmental(int step) {
 
 void BioMechanismScheduler::launch_replay(int step) {
     PersistentBuffers& buf = alloc_->buffers();
-    if (!buf.d_hippo_indices || !buf.d_replay_injection) return;
-    // P1 占位 (Phase 4 实现睡眠重放)
+    if (!buf.d_hippo_indices || !buf.d_replay_injection || !buf.d_pca_W) return;
+
+    // warmup: 步数 > REPLAY_WARMUP_STEPS 才触发
+    if (step <= REPLAY_WARMUP_STEPS) return;
+
+    // ==================== Task 18: 进入睡眠态 ====================
+    // 保存当前 thalamic_gain (gate_mean_) 和 ach_level, 设置 is_sleeping_=true
+    // 后续 step() 的 input_inject 步检查 is_sleeping_ 跳过外部字节注入
+    enter_sleep_state(step);
+
+    // 清零重放注入缓冲
+    CUDA_CHECK_2E(cudaMemsetAsync(buf.d_replay_injection, 0,
+                                   N_ASSOCIATION_NEURONS_2E * sizeof(float)));
+
+    // 调用海马重放完整流程
+    launch_replay_cycle(
+        buf.d_hippo_indices,
+        buf.d_hippo_top_k,
+        buf.d_hippo_filled_count,
+        buf.d_replay_injection,
+        d_replay_sig_,
+        buf.d_pca_W,
+        d_pca_mean_,
+        d_replay_recon_,
+        step,
+        HIPP_INDEX_SIZE,
+        HIPP_REPLAY_BATCH);
+
+    replay_cycle_count_++;
+    printf("[Stage2e P4] step=%d 睡眠重放周期 #%d 完成 (重放 %d 模式)\n",
+           step, replay_cycle_count_, HIPP_REPLAY_BATCH);
+
+    // ==================== Task 18: 退出睡眠态 ====================
+    // 恢复 thalamic_gain 和 ach_level, is_sleeping_=false
+    exit_sleep_state(step);
+}
+
+// ==================== Task 18: 睡眠重放状态隔离实现 ====================
+// enter_sleep_state: 进入睡眠态
+//   1. 保存当前 gate_mean_ (host 缓存的丘脑门控均值) 到 saved_thalamic_gain_
+//   2. 保存当前 stats_.ach_level (host 缓存的 ACh 水平) 到 saved_ach_level_
+//   3. 设置 stats_.ach_level *= SLEEP_ACH_FACTOR (慢波睡眠 ACh 降至 ~30%)
+//   4. 设置 is_sleeping_ = true (后续 input_inject / modulatory 步查询此标志)
+// 生物学意义: 慢波睡眠期间丘脑门控关闭外部输入, ACh 水平降低切换到巩固模式
+// P0 修复: stats_.ach_level 已在每 100 步 modulatory 更新后同步赋值 (line 608)
+void BioMechanismScheduler::enter_sleep_state(int step) {
+    saved_thalamic_gain_ = gate_mean_;
+    saved_ach_level_     = stats_.ach_level;
+    stats_.ach_level    *= SLEEP_ACH_FACTOR;
+    is_sleeping_         = true;
+    sleep_cycle_count_++;
+    printf("[Stage2e P4] step=%d 进入睡眠重放态, 外部输入已抑制 (ach=%.4f→%.4f)\n",
+           step, saved_ach_level_, stats_.ach_level);
+}
+
+// exit_sleep_state: 退出睡眠态, 恢复清醒态参数
+//   1. 恢复 stats_.ach_level = saved_ach_level_
+//   2. (gate_mean_ 由下一次 launch_thalamic_gate_update 自然刷新, 无需主动恢复)
+//   3. 设置 is_sleeping_ = false
+void BioMechanismScheduler::exit_sleep_state(int step) {
+    stats_.ach_level = saved_ach_level_;
+    is_sleeping_     = false;
+    printf("[Stage2e P4] step=%d 退出睡眠重放态, 恢复外部输入 (ach=%.4f)\n",
+           step, stats_.ach_level);
+}
+
+// ==================== Task 2: PCA 集成实现 ====================
+// launch_pca_update_cpu: 每 PCA_UPDATE_INTERVAL 步在 CPU 端执行 Oja's rule 在线学习
+//   1. 收集联合皮层 (前 N_ASSOCIATION_NEURONS_2E 个神经元) 发放率快照到 CPU
+//      从 d_spike_flags (bool) 拷贝并转为 float (0/1 = 当前步是否发放)
+//   2. 更新滑动平均发放率 h_mean_fr_ (EMA)
+//   3. CPU 端 Oja 在线更新 h_pca_W_
+//      中心化向量 x[i] = fr[i] - mean[i]
+//      投影  proj[k] = Σ_i W[i*K+k] · x[i]
+//      更新  W[i*K+k] += η · (x[i] - W[i*K+k]·proj[k]) · proj[k]
+//   4. 每 PCA_SYNC_INTERVAL 步同步 h_pca_W_ 到 GPU d_pca_W
+//      (同时同步 h_mean_fr_ 到 d_pca_mean_ 供 compute_pca_signature 用)
+void BioMechanismScheduler::launch_pca_update_cpu(int step) {
+    PersistentBuffers& buf = alloc_->buffers();
+    if (!buf.d_spike_flags || !buf.d_pca_W) return;
+
+    const int N = N_ASSOCIATION_NEURONS_2E;   // 50,000 联合皮层神经元
+    const int K = PCA_N_COMPONENTS;            // 50 主成分
+    const float lr = PCA_LEARNING_RATE;        // η = 0.01
+
+    // 1. 收集联合皮层发放率快照: d_spike_flags (bool) → h_fr_snapshot_ (float)
+    //    d_spike_flags 含全部 60K 神经元, 仅拷贝前 50K (联合皮层) 部分
+    CUDA_CHECK_2E(cudaMemcpy(h_spike_buf_.data(), buf.d_spike_flags,
+                             N * sizeof(bool), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < N; ++i) {
+        h_fr_snapshot_[i] = h_spike_buf_[i] ? 1.0f : 0.0f;
+    }
+
+    // 2. 更新滑动平均发放率 h_mean_fr_ (EMA)
+    //    mean = ema · mean_old + (1-ema) · fr_new
+    const float ema = h_mean_fr_ema_;
+    const float inv_ema = 1.0f - ema;
+    for (int i = 0; i < N; ++i) {
+        h_mean_fr_[i] = ema * h_mean_fr_[i] + inv_ema * h_fr_snapshot_[i];
+    }
+
+    // 3. CPU 端 Oja's rule 在线更新 h_pca_W_
+    // 阶段1: 单次遍历 N, 计算所有 K 个主成分的投影 proj[k]
+    //   内层 K 循环访问连续内存 W[i*K+0..K-1], cache 友好
+    float proj[PCA_N_COMPONENTS];
+    for (int k = 0; k < K; ++k) proj[k] = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float x = h_fr_snapshot_[i] - h_mean_fr_[i];   // 中心化向量
+        size_t base = (size_t)i * K;
+        for (int k = 0; k < K; ++k) {
+            proj[k] += h_pca_W_[base + k] * x;
+        }
+    }
+    // 阶段2: Oja 更新 W[i][k] += η · (x[i] - W[i][k]·proj[k]) · proj[k]
+    //   需阶段1 全部完成 (proj[k] 依赖所有 i), 故分两趟
+    for (int i = 0; i < N; ++i) {
+        float x = h_fr_snapshot_[i] - h_mean_fr_[i];
+        size_t base = (size_t)i * K;
+        for (int k = 0; k < K; ++k) {
+            float w = h_pca_W_[base + k];
+            h_pca_W_[base + k] = w + lr * (x - w * proj[k]) * proj[k];
+        }
+    }
+
+    // 4. 每 PCA_SYNC_INTERVAL 步同步 h_pca_W_ 到 GPU d_pca_W
+    //    同时同步 h_mean_fr_ 到 d_pca_mean_ (供 compute_pca_signature / pca_back_project)
+    if (step % PCA_SYNC_INTERVAL == 0) {
+        CUDA_CHECK_2E(cudaMemcpy(buf.d_pca_W, h_pca_W_.data(),
+                                 (size_t)N * K * sizeof(float),
+                                 cudaMemcpyHostToDevice));
+        CUDA_CHECK_2E(cudaMemcpy(d_pca_mean_, h_mean_fr_.data(),
+                                 N * sizeof(float), cudaMemcpyHostToDevice));
+    }
+
+    pca_update_count_++;
+}
+
+// compute_pca_signature: 从当前联合皮层发放率提取 K 维 PCA 签名 (L2 归一化)
+//   供海马编码和 WM 写入调用, 调用方分配 d_signature_out [PCA_N_COMPONENTS]
+//   内部: d_spike_flags (bool) → d_pca_fr_ (float), 同步 h_mean_fr_ → d_pca_mean_,
+//         调用 launch_pca_encode(d_pca_W, d_pca_fr_, d_pca_mean_, d_signature_out, N, K)
+void BioMechanismScheduler::compute_pca_signature(float* d_signature_out) {
+    PersistentBuffers& buf = alloc_->buffers();
+    if (!buf.d_pca_W || !buf.d_spike_flags || !d_pca_fr_ || !d_pca_mean_ || !d_signature_out) return;
+
+    const int N = N_ASSOCIATION_NEURONS_2E;
+    const int K = PCA_N_COMPONENTS;
+
+    // 1. 当前发放率: d_spike_flags (bool) → d_pca_fr_ (float)
+    int blocks = (N + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    pca_spike_to_float_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        buf.d_spike_flags, d_pca_fr_, N);
+
+    // 2. 同步 h_mean_fr_ 到 d_pca_mean_ (确保 GPU 端 mean 是最新的)
+    CUDA_CHECK_2E(cudaMemcpy(d_pca_mean_, h_mean_fr_.data(),
+                             N * sizeof(float), cudaMemcpyHostToDevice));
+
+    // 3. 调用 PCA 签名提取 kernel (输出 L2 归一化的 K 维签名)
+    launch_pca_encode(buf.d_pca_W, d_pca_fr_, d_pca_mean_,
+                      d_signature_out, N, K);
+}
+
+// pca_back_project: 从 K 维签名全量反投影重建 N 维联合皮层发放率
+//   供睡眠重放和 WM 注入调用, 调用方分配 d_reconstructed_out [N_ASSOCIATION_NEURONS_2E]
+//   内部: 调用 launch_pca_back_project(d_pca_W, d_pca_mean_, d_signature, d_reconstructed_out, N, K)
+//   重建: recon[i] = mean[i] + Σ_k sig[k] · W[i][k]
+void BioMechanismScheduler::pca_back_project(const float* d_signature,
+                                              float* d_reconstructed_out) {
+    PersistentBuffers& buf = alloc_->buffers();
+    if (!buf.d_pca_W || !d_pca_mean_ || !d_signature || !d_reconstructed_out) return;
+
+    const int N = N_ASSOCIATION_NEURONS_2E;
+    const int K = PCA_N_COMPONENTS;
+
+    // 调用 PCA 反投影 kernel: recon[i] = mean[i] + Σ_k sig[k]·W[i][k]
+    launch_pca_back_project(buf.d_pca_W, d_pca_mean_, d_signature,
+                            d_reconstructed_out, N, K);
+}
+
+// ==================== Task 4-5: 在线解码 step 实现 ====================
+// 流程:
+//   1. 每步: launch_decode_forward (前向 + softmax + argmax) → 拷贝 predicted_byte 到 host
+//   2. 仅注入步 + warmup 完成 + update_weights=true:
+//      a. 把 current_input_byte 推入 input_byte_history_ 环形缓冲
+//      b. target_byte = 最旧字节 (K 步前注入, 网络当前活动反映其延迟效应)
+//      c. launch_decode_error: 计算 error = softmax_prob - one_hot(target), 返回 loss
+//      d. launch_decode_weight_update: ΔW = -η · error · spike_flags
+//      e. 更新 perplexity / accuracy 统计
+//   3. 每 100 个 decode_step 调用: launch_decode_weight_normalize (行 L2 归一化)
+//   4. 每 PERPLEXITY_LOG_INTERVAL 个调用: 打印 perplexity + accuracy
+void BioMechanismScheduler::decode_step(uint8_t current_input_byte,
+                                         bool is_inject_step,
+                                         bool update_weights) {
+    PersistentBuffers& buf = alloc_->buffers();
+    // 防御: 解码权重未分配时直接跳过 (避免 nullptr deref)
+    if (!buf.d_decode_weights || !buf.d_spike_flags || !buf.d_decode_logits) return;
+
+    // ---- 1. 前向解码 (每步) ----
+    // 内部链: forward_kernel → softmax_kernel → argmax_kernel
+    launch_decode_forward(buf);
+
+    // 拷贝预测字节到 host (同步, 因为后续准确率统计需要立即使用)
+    int h_pred = 0;
+    CUDA_CHECK_2E(cudaMemcpy(&h_pred, buf.d_decode_predicted_byte,
+                              sizeof(int), cudaMemcpyDeviceToHost));
+    last_predicted_byte_ = h_pred;
+
+    // ---- 2. 误差驱动权重更新 (仅注入步 + warmup 完成 + 允许更新) ----
+    if (is_inject_step && update_weights) {
+        // 推入环形缓冲 (覆盖最旧)
+        input_byte_history_[input_byte_history_idx_] = current_input_byte;
+        input_byte_history_idx_ = (input_byte_history_idx_ + 1) % PREDICTION_DELAY_STEPS;
+        if (input_byte_history_count_ < PREDICTION_DELAY_STEPS) {
+            input_byte_history_count_++;
+        }
+
+        // 仅在 warmup 完成后 (历史缓冲填满) 才执行学习
+        // target = K 步前注入的字节 (环形缓冲中最旧的一个, 即将被打入写入位置)
+        if (input_byte_history_count_ >= PREDICTION_DELAY_STEPS) {
+            uint8_t target_byte = input_byte_history_[input_byte_history_idx_];
+
+            // 2a. 计算误差 + loss
+            float h_loss = 0.0f;
+            launch_decode_error(buf, target_byte, h_loss);
+
+            // 2b. 权重更新 (ΔW = -η · error · spike_flags)
+            launch_decode_weight_update(buf);
+
+            // 2c. 统计
+            last_decode_loss_ = h_loss;
+            cross_entropy_loss_accum_ += h_loss;
+            loss_accum_count_++;
+            predict_total_count_++;
+            if (last_predicted_byte_ == (int)target_byte) {
+                correct_predict_count_++;
+            }
+        }
+    }
+
+    // ---- 3. 行 L2 归一化 (每 100 步) ----
+    decode_step_counter_++;
+    if (decode_step_counter_ % 100 == 0) {
+        launch_decode_weight_normalize(buf);
+    }
+
+    // ---- 4. perplexity 日志 (每 PERPLEXITY_LOG_INTERVAL 步) ----
+    if (decode_step_counter_ % PERPLEXITY_LOG_INTERVAL == 0 && loss_accum_count_ > 0) {
+        float avg_loss = cross_entropy_loss_accum_ / (float)loss_accum_count_;
+        float perplexity = expf(avg_loss);
+        float accuracy = predict_total_count_ > 0
+            ? 100.0f * (float)correct_predict_count_ / (float)predict_total_count_
+            : 0.0f;
+        printf("[Stage2e Decode] step=%d  avg_loss=%.4f  perplexity=%.2f  "
+               "accuracy=%.2f%% (%d/%d)  last_pred=%d\n",
+               decode_step_counter_, avg_loss, perplexity, accuracy,
+               correct_predict_count_, predict_total_count_, last_predicted_byte_);
+        // 周期性重置累积器 (输出的是窗口平均值, 不是全局平均)
+        cross_entropy_loss_accum_ = 0.0f;
+        loss_accum_count_ = 0;
+    }
 }
 
 // ==================== 日志 ====================
@@ -1007,6 +1506,15 @@ void BioMechanismScheduler::print_step_log(int step) {
            stats_.total_spikes, delay_ring_idx_, delay_queue_stats().last_arrived_events,
            total_steps_ > 0 ? (100.0f * total_burst_steps_ / total_steps_) : 0.0f,
            l6_total_spikes_last_, l6_activity_ema_mean_, gate_mean_);
+
+    // Task 2: PCA 状态日志 (每 LOG_INTERVAL_2E 步输出一次)
+    //   W_norm = ||W||_F = sqrt(Σ_{i,k} W[i][k]²), 反映 PCA 基矩阵整体能量
+    float pca_w_sq_sum = 0.0f;
+    for (size_t idx = 0; idx < h_pca_W_.size(); ++idx) {
+        pca_w_sq_sum += h_pca_W_[idx] * h_pca_W_[idx];
+    }
+    float pca_w_norm = sqrtf(pca_w_sq_sum);
+    printf("[PCA] updates=%d W_norm=%.4f\n", pca_update_count_, pca_w_norm);
 }
 
 void BioMechanismScheduler::print_phase_change(int step, DevPhase new_phase) {

@@ -61,6 +61,18 @@ const DelayQueueRuntimeStats& delay_queue_stats();
 bool export_delay_queue_state(DelayQueueCheckpointState* state);
 bool import_delay_queue_state(const DelayQueueCheckpointState& state);
 
+// ==================== Task 7: 运动皮层 AdEx 更新 ====================
+//
+// 复用现有 lif_adex_kernel 对运动皮层神经元 (d_motor_neurons) 进行 AdEx 更新。
+//   - 输入电流: 来自 launch_l5_to_motor_synapse 写入的 motor_input_current
+//   - NMDA / 抑制电流: 简化为零缓冲 (运动皮层暂不实现 NMDA/抑制)
+//   - burst 计数: 内部静态计数器 (与主网络 single_neuron_burst_counter 分离,
+//     不暴露给 scheduler, 避免新增 checkpoint 字段)
+//
+// 缓冲区: 零缓冲 (nmda/inhibitory/burst_counter) 为静态 device 缓冲, 懒分配, 生命周期 = 程序
+void launch_motor_adex(MemoryAllocator* alloc, int step,
+                       const struct DevPhaseParams& phase);
+
 } // namespace stage2e
 
 #endif // SNN_STAGE2E_NEURON_KERNELS_CUH

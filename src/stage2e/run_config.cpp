@@ -42,6 +42,24 @@ bool parse_u32(const char* text, const char* option, uint32_t* value,
     return true;
 }
 
+// Task 10: 浮点参数解析 (用于 --decode-lr)
+bool parse_float(const char* text, const char* option, float* value,
+                 std::string* error) {
+    if (!text || !*text) {
+        *error = std::string(option) + " requires a value";
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const float parsed = std::strtof(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0') {
+        *error = std::string("invalid value for ") + option + ": " + text;
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
 } // namespace
 
 bool parse_run_config(int argc, char** argv, RunConfig* config, std::string* error) {
@@ -107,6 +125,18 @@ bool parse_run_config(int argc, char** argv, RunConfig* config, std::string* err
             value = require_value(&i, "--resume");
             if (!value) return false;
             config->resume_path = value;
+        } else if (arg == "--decode-lr") {
+            // Task 10: 解码学习率 (float)
+            value = require_value(&i, "--decode-lr");
+            if (!value || !parse_float(value, "--decode-lr", &config->decode_lr, error)) return false;
+        } else if (arg == "--eval-mode") {
+            // Task 10: 仅推理模式 (布尔标志, 不更新 W_decode)
+            config->eval_mode = true;
+        } else if (arg == "--eval-text") {
+            // Task 10: held-out 评估文本路径
+            value = require_value(&i, "--eval-text");
+            if (!value) return false;
+            config->eval_text_path = value;
         } else {
             *error = "unknown option: " + arg;
             return false;
@@ -136,6 +166,9 @@ const char* run_config_usage() {
         "  --synthetic-input         explicit 0..255 cyclic smoke-test input\n"
         "  --strict-criteria         return nonzero when scientific criteria are unmet\n"
         "  --e0                      pure-STDP ablation\n"
+        "  --decode-lr F             decode learning rate (default: 0.001)\n"
+        "  --eval-mode               inference only (freeze W_decode, no weight updates)\n"
+        "  --eval-text PATH          held-out evaluation text corpus path\n"
         "  -h, --help                show this help\n";
 }
 

@@ -89,6 +89,27 @@ void launch_synaptic_scaling(MemoryAllocator* alloc, int step, float target_fr);
 // E0 消融模式: 设置 device 开关 (关闭三因素调制 + CaMKII)
 void set_e0_ablation(bool enable);
 
+// ==================== Task 7: L5 → 运动皮层突触传递 ====================
+//
+// 把联合皮层 L5 层的脉冲信号通过稀疏 CSR 突触传递到运动皮层神经元。
+//   - 突触结构: d_l5_to_motor_synapses (250K, CSR 格式)
+//   - 每个运动神经元接收 50 个来自对应柱 L5 层的兴奋性突触
+//   - 突触前神经元 spike 状态从主网络 d_spike_flags[0, 55000) 读取
+//   - 输出: motor_input_current[i] = Σ_k (s.weight * s.resource) for spiked pre
+//
+// 简化版受体模型 (无需 STP):
+//   电流 = weight × resource (与 delay_dispatch_kernel 一致)
+//   resource 来自 BioSynapse.resource (初始 1.0, STP 动态调整, 但 L5→Motor 暂不更新 STP)
+//
+// 缓冲区: motor_input_current 为静态 device 缓冲 (N_MOTOR_NEURONS × 4B = 20KB),
+//         首次调用时懒分配, 程序生命周期内复用 (与 d_delay_counters 模式一致)
+void launch_l5_to_motor_synapse(MemoryAllocator* alloc);
+
+// 获取运动皮层输入电流缓冲指针 (供 launch_motor_adex 读取)
+// 返回: float* 指向 N_MOTOR_NEURONS 个 float 的 device 缓冲
+//       若未调用过 launch_l5_to_motor_synapse, 返回 nullptr
+float* get_motor_input_current();
+
 } // namespace stage2e
 
 #endif // SNN_STAGE2E_SYNAPSE_KERNELS_CUH

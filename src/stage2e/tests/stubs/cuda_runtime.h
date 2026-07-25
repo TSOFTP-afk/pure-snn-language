@@ -5,6 +5,46 @@
 // do not have the CUDA toolkit. This file is never on the production include path.
 #include <cstddef>
 
+// CUDA 执行空间限定符 fallback (host-only 编译时全部置空)
+// types.h 已定义 __host__/__device__ fallback; 此处补充 kernel/共享内存限定符
+#ifndef __global__
+  #define __global__
+#endif
+#ifndef __shared__
+  #define __shared__
+#endif
+#ifndef __restrict__
+  #define __restrict__
+#endif
+#ifndef __constant__
+  #define __constant__
+#endif
+#ifndef __managed__
+  #define __managed__
+#endif
+
+// CUDA 内建向量类型 (仅 host 语法检查用, 不实际使用)
+struct float2 {
+    float x;
+    float y;
+};
+struct float3 {
+    float x;
+    float y;
+    float z;
+};
+struct float4 {
+    float x;
+    float y;
+    float z;
+    float w;
+};
+struct dim3 {
+    unsigned int x, y, z;
+    dim3(unsigned int vx = 1, unsigned int vy = 1, unsigned int vz = 1)
+        : x(vx), y(vy), z(vz) {}
+};
+
 using cudaError_t = int;
 constexpr cudaError_t cudaSuccess = 0;
 

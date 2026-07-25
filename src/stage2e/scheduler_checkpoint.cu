@@ -165,7 +165,7 @@ std::vector<Section> SchedulerCheckpointAccess::make_sections(
     BioMechanismScheduler* self, SchedulerState* state) {
     PersistentBuffers& b = self->alloc_->buffers();
     std::vector<Section> s;
-    s.reserve(55);
+    s.reserve(56);
     add(&s, "scheduler_state", state, 1, sizeof(*state), false);
     add(&s, "neurons", b.d_neurons, N_TOTAL_NEURONS_2E, sizeof(NeuronStateAdEx));
     add(&s, "spike_flags", b.d_spike_flags, N_TOTAL_NEURONS_2E, sizeof(bool));
@@ -223,6 +223,11 @@ std::vector<Section> SchedulerCheckpointAccess::make_sections(
     add(&s, "layer_act_count", self->d_layer_act_count_, 5, sizeof(int));
     add(&s, "layer_chi2_sum", self->d_layer_chi2_sum_, 5, sizeof(float));
     add(&s, "injections_per_byte", self->d_injections_per_byte_, 256, sizeof(float));
+    // 解码权重矩阵 (Stage 2e 线性解码器: 神经活动 → 256 维字节 logits)
+    // 布局 [N_TOTAL_NEURONS_2E × 256] float, 60K × 256 × 4B ≈ 58.6 MB
+    // 放在 section 表末尾, 旧版 checkpoint 未含此 section 时 load 端可优雅降级
+    add(&s, "decode_weights", b.d_decode_weights,
+        (uint64_t)N_TOTAL_NEURONS_2E * 256, sizeof(float));
     return s;
 }
 
@@ -467,13 +472,33 @@ int BioMechanismScheduler::load_checkpoint(const char* path, int* next_step,
     ok = read_exact(fp, disk.data(), disk.size() * sizeof(DiskSection));
     SchedulerState state{};
     auto sections = SchedulerCheckpointAccess::make_sections(this, &state);
+    // decode_weights 为可选 section (旧版 v3 checkpoint 未包含), 缺失时需优雅降级
+    bool decode_weights_missing = false;
     if (!ok || !section_layout_matches(sections, disk)) {
-        std::fclose(fp);
-        std::fprintf(stderr, "[Checkpoint] section layout mismatch: %s\n", path);
-        return 4;
+        // 旧版兼容: 若磁盘仅缺少末尾的 decode_weights, 视为合法旧 checkpoint
+        const bool tail_is_decode = !sections.empty() &&
+            std::strcmp(sections.back().name, "decode_weights") == 0 &&
+            disk.size() + 1 == sections.size();
+        bool prefix_ok = tail_is_decode;
+        for (size_t i = 0; prefix_ok && i < disk.size(); ++i) {
+            if (std::strncmp(sections[i].name, disk[i].name, sizeof(disk[i].name)) != 0 ||
+                sections[i].bytes != disk[i].bytes) {
+                prefix_ok = false;
+            }
+        }
+        if (!ok || !prefix_ok) {
+            std::fclose(fp);
+            std::fprintf(stderr, "[Checkpoint] section layout mismatch: %s\n", path);
+            return 4;
+        }
+        decode_weights_missing = true;
     }
     uint64_t expected_payload_bytes = 0;
     for (const auto& section : sections) {
+        if (decode_weights_missing &&
+            std::strcmp(section.name, "decode_weights") == 0) {
+            continue;  // 旧 checkpoint 无此 section, 不计入 payload
+        }
         if (!section.pointer && section.bytes > 0) {
             std::fclose(fp);
             return 4;
@@ -523,6 +548,11 @@ int BioMechanismScheduler::load_checkpoint(const char* path, int* next_step,
         return 6;
     }
     for (const auto& section : sections) {
+        // 旧 checkpoint 缺少 decode_weights: 跳过读取, 循环结束后零初始化
+        if (decode_weights_missing &&
+            std::strcmp(section.name, "decode_weights") == 0) {
+            continue;
+        }
         uint64_t offset = 0;
         while (ok && offset < section.bytes) {
             const size_t count = static_cast<size_t>(
@@ -538,6 +568,14 @@ int BioMechanismScheduler::load_checkpoint(const char* path, int* next_step,
             }
             offset += count;
         }
+    }
+    // decode_weights 在旧 checkpoint 中不存在: 零初始化并告警
+    if (decode_weights_missing) {
+        PersistentBuffers& pb = alloc_->buffers();
+        const cudaError_t err = cudaMemset(pb.d_decode_weights, 0,
+            (size_t)N_TOTAL_NEURONS_2E * 256 * sizeof(float));
+        if (err != cudaSuccess) ok = false;
+        std::printf("[Checkpoint] 警告: decode_weights section 未找到, 用零初始化\n");
     }
     std::fclose(fp);
     if (!ok || state.state_version != 1 || state.state_bytes != sizeof(state)) return 7;

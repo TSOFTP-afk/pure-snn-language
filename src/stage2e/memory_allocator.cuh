@@ -72,7 +72,7 @@ struct PersistentBuffers {
     // 输入电流缓冲
     float*             d_input_current;          // 55,000 × 4B
     float*             d_nmda_current;           // 55,000 × 4B
-    float2*            d_nmda_post_state;        // 55,000 × (V_norm, Mg factor)
+    float2*            d_nmda_post_state = nullptr;  // 55,000 × (V_norm, Mg factor) 瞬态缓存, 每步由 nmda_post_state_kernel 从 d_neurons 重算, 无需 checkpoint
     float*             d_inhibitory_current;     // 55,000 × 4B
 
     // 调质浓度 (4 种 × 55K × 4B = 0.88 MB)
@@ -83,12 +83,25 @@ struct PersistentBuffers {
 
     // 海马体索引 (v3 强化 C: 50K × 256B = 12.8 MB)
     HippoIndex*        d_hippo_indices;          // 50,000
+    // Task 3 海马编码 kernel: LRU 游标 + 已填充计数 + top-K 索引缓冲
+    //   d_hippo_write_cursor: [1] 环形 LRU 写入游标, 新颖模式写入此槽位后递增
+    //   d_hippo_filled_count: [1] 已填充条目数 (上限 HIPP_INDEX_SIZE), top-K 选取范围
+    //   d_hippo_top_k:        [HIPP_REPLAY_BATCH] top-K 索引, 重放前由 kernel 写入
+    // 三者均为 runtime 状态 (非模型权重), 不进 checkpoint (= nullptr 初始值豁免)
+    int*               d_hippo_write_cursor = nullptr;  // [1] LRU 写入游标
+    int*               d_hippo_filled_count = nullptr;  // [1] 已填充条目数
+    int*               d_hippo_top_k        = nullptr;  // [HIPP_REPLAY_BATCH] top-K 索引 (重放用)
 
     // 共激活跟踪器 (v3 强化 D: 500K × 16B = 8 MB)
     CoactTracker*      d_coact_trackers;         // 500,000
+    int*               d_tracker_count = nullptr; // [1] 当前已用 tracker 条目数 (Task 6, append-only)
 
     // 工作记忆槽位 (v3 强化 E: 50 × 216B)
     WMSlot*            d_wm_slots;               // 50
+
+    // Task 9: WM 完整闭环缓冲
+    int*               d_wm_write_cursor = nullptr;   // [1] WM LRU 写入游标
+    float*             d_prefrontal_input = nullptr;   // [N_PREFRONTAL_NEURONS] 前额叶输入电流缓冲
 
     // DA 价值函数相关 (亚柱级 200 维, CPU 端为主, GPU 镜像)
     float*             d_subcolumn_fr;           // 200 × 4B (当前亚柱发放直方图)
@@ -96,6 +109,7 @@ struct PersistentBuffers {
     float*             d_w_pred;                 // 200 × 200 × 4B = 160KB (CPU-GPU 镜像)
     float*             d_w_value;                // 200 × 4B
     float*             d_pred_fr;                // 200 × 4B (预测器输出)
+    float*             d_subcol_fr_prev = nullptr;  // 200 × 4B (上一步亚柱发放率, W_pred 完整矩阵预测用)
 
     // 字节直方图 (NE 用)
     int*               d_byte_histogram;         // 256 × 4B
@@ -105,6 +119,31 @@ struct PersistentBuffers {
 
     // 重放注入缓冲 (睡眠态用)
     float*             d_replay_injection;       // 55,000 × 4B
+
+    // ---------------------------------------------------------------------
+    // 语言运动皮层 (Stage 2e "语言运动皮层"基础设施)
+    // ---------------------------------------------------------------------
+    // 运动皮层神经元状态 (5K × 56B = 0.28 MB) + 脉冲标志 (5K × 1B)
+    NeuronStateAdEx*   d_motor_neurons = nullptr;          // [N_MOTOR_NEURONS]
+    bool*              d_motor_spike_flags = nullptr;       // [N_MOTOR_NEURONS]
+
+    // 线性解码器: 神经活动 → 256 维字节 logits
+    // d_decode_weights: [N_TOTAL_NEURONS_2E × 256] ≈ 60K×256×4B = 58.6 MB
+    // d_decode_logits / d_decode_error: [256]
+    // d_decode_predicted_byte: [1] host-readable, 用于 CPU 端读取预测字节
+    float*             d_decode_weights = nullptr;          // [N_TOTAL_NEURONS_2E × 256]
+    float*             d_decode_logits = nullptr;           // [256]
+    float*             d_decode_error = nullptr;            // [256]
+    int*               d_decode_predicted_byte = nullptr;   // [1] host-readable
+
+    // L5 → 运动皮层稀疏 CSR 突触 (250K 突触, 每运动神经元 50 个 L5 突触)
+    // 突触结构 80B + 权重 4B + CSR col_idx 4B
+    // 总计 250K × (80 + 4 + 4)B = 250K × 88B ≈ 21 MB
+    // CSR row_ptr: (5000 + 1) × 4B
+    BioSynapse*        d_l5_to_motor_synapses = nullptr;    // [N_MOTOR_NEURONS × L5_TO_MOTOR_SYNAPSES_PER_NEURON] = 250K
+    float*             d_l5_to_motor_weights = nullptr;     // 同上数量, 权重镜像
+    int*               d_l5_to_motor_csr_row_ptr = nullptr; // [N_MOTOR_NEURONS + 1] = 5001
+    int*               d_l5_to_motor_csr_col_idx = nullptr; // [N_MOTOR_NEURONS × L5_TO_MOTOR_SYNAPSES_PER_NEURON] = 250K
 };
 
 // -----------------------------------------------------------------------------

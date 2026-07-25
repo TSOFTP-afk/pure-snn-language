@@ -25,7 +25,10 @@
 #include "types.h"
 #include "memory_allocator.cuh"
 #include "thalamic_gate.cuh"
+#include "decode_kernels.cuh"
 #include <climits>
+#include <cmath>
+#include <vector>
 
 namespace stage2e {
 
@@ -71,12 +74,50 @@ public:
     // E0 消融模式: 关闭三因素调制 + CaMKII + 调质系统 (纯 STDP 基线)
     bool e0_ablation = false;
 
+    // Task 10: 评估模式控制 (参照 e0_ablation 公共成员模式)
+    // decode_update_weights: false 时 decode_step 不更新 W_decode (仅前向预测, 用于评估)
+    //   默认 true = 训练模式 (保持向后兼容)
+    //   main.cpp 根据 config.eval_mode 设置: eval_mode=true → decode_update_weights=false
+    bool decode_update_weights = true;
+    // decode_lr: 解码学习率 (由 RunConfig.decode_lr 传入, kernel 暂用编译常量 DECODE_LEARNING_RATE)
+    //   存储此处供后续 kernel 改造使用, 当前仅作元数据记录
+    float decode_lr = DECODE_LEARNING_RATE;
+
     // 主步进函数
     void step(int current_step);
 
     // 获取统计
     const NetworkStats2e& stats() const { return stats_; }
     int delay_ring_idx() const { return delay_ring_idx_; }
+
+    // ==================== Task 4-5: 在线解码接口 ====================
+    // 解码一步: 前向 (每步) + 误差驱动权重更新 (注入步 + K 步延迟后)
+    //   current_input_byte: 当前注入的字节 (非注入步可传 0)
+    //   is_inject_step:     当前步是否为注入步
+    //   update_weights:     是否执行权重更新 (false=仅前向预测, 用于评估)
+    void decode_step(uint8_t current_input_byte, bool is_inject_step, bool update_weights);
+
+    // 最近一次解码 cross-entropy loss (host 缓存)
+    float get_last_decode_loss() const { return last_decode_loss_; }
+
+    // 最近一次解码预测字节 (host 缓存, 0..255)
+    int get_last_predicted_byte() const { return last_predicted_byte_; }
+
+    // 解码 perplexity 统计 (供 main.cpp 读取)
+    float get_decode_avg_loss() const {
+        return loss_accum_count_ > 0 ? cross_entropy_loss_accum_ / loss_accum_count_ : 0.0f;
+    }
+    float get_decode_perplexity() const {
+        float avg = get_decode_avg_loss();
+        return avg > 0.0f ? expf(avg) : 0.0f;
+    }
+    float get_decode_accuracy() const {
+        return predict_total_count_ > 0
+            ? (float)correct_predict_count_ / (float)predict_total_count_
+            : 0.0f;
+    }
+    int get_decode_correct_count() const { return correct_predict_count_; }
+    int get_decode_total_count() const { return predict_total_count_; }
 
     // P1 统计
     int total_steps_executed() const { return total_steps_; }
@@ -134,6 +175,30 @@ public:
     float burst_ratio() const {
         return total_steps_ > 0 ? (100.0f * total_burst_steps_ / total_steps_) : 0.0f;
     }
+
+    // ==================== Task 2: PCA 集成接口 ====================
+    // PCA 签名提取: 从当前联合皮层发放率计算 K 维 PCA 签名 (L2 归一化)
+    //   供海马编码和 WM 写入调用
+    //   d_signature_out: [PCA_N_COMPONENTS] 输出签名 (device, 调用方分配)
+    void compute_pca_signature(float* d_signature_out);
+
+    // PCA 反投影: 从 K 维签名重建 N 维联合皮层发放率
+    //   供睡眠重放和 WM 注入调用
+    //   d_signature:         [PCA_N_COMPONENTS] 输入签名 (device)
+    //   d_reconstructed_out: [N_ASSOCIATION_NEURONS_2E] 输出重建 (device, 调用方分配)
+    void pca_back_project(const float* d_signature, float* d_reconstructed_out);
+
+    // PCA 更新次数计数 (供 FINAL_METRICS 输出)
+    int pca_update_count() const { return pca_update_count_; }
+
+    // ==================== Task 18: 睡眠重放状态隔离接口 ====================
+    // enter_sleep_state: 进入睡眠态, 保存当前 thalamic_gain (gate_mean_) 和 ach_level,
+    //   设置 ach_level *= SLEEP_ACH_FACTOR (巩固模式), is_sleeping_=true
+    // exit_sleep_state: 退出睡眠态, 恢复保存的 ach_level, is_sleeping_=false
+    // is_sleeping: 供 step() 内 input_inject / modulatory 步查询, true 时跳过外部输入
+    void enter_sleep_state(int step);
+    void exit_sleep_state(int step);
+    bool is_sleeping() const { return is_sleeping_; }
 
 private:
     friend struct SchedulerCheckpointAccess;
@@ -204,6 +269,65 @@ private:
     float* d_gate_stats_;                      // 门控统计 [gate_mean, gate_open_ratio, gate_min, gate_max]
     float gate_mean_;                          // 最近一次门控均值 (host 缓存)
     float gate_open_ratio_;                    // 最近一次门控开启比例 (host 缓存)
+
+    // ==================== Task 4-5: 在线解码状态 ====================
+    float last_decode_loss_ = 0.0f;            // 最近一次解码 cross-entropy loss
+    int   last_predicted_byte_ = 0;            // 最近一次解码预测字节 (0..255)
+    int   decode_step_counter_ = 0;            // 解码步计数 (用于每 100 步行归一化调度)
+    float cross_entropy_loss_accum_ = 0.0f;    // perplexity 累积器 (周期性重置)
+    int   loss_accum_count_ = 0;               // 累积次数 (配合 cross_entropy_loss_accum_)
+    int   correct_predict_count_ = 0;          // 准确率统计: 正确预测次数
+    int   predict_total_count_ = 0;            // 准确率统计: 总预测次数
+    // 输入字节历史缓冲 (环形, 大小 = PREDICTION_DELAY_STEPS)
+    // 用途: 延迟 K 步匹配 — 当缓冲区填满后, 最旧字节作为前向解码的 target
+    //       (网络当前活动反映 K 步前注入字节的延迟效应, 解码器学习读出该字节)
+    uint8_t input_byte_history_[PREDICTION_DELAY_STEPS] = {0};
+    int   input_byte_history_idx_ = 0;         // 环形缓冲写指针
+    int   input_byte_history_count_ = 0;       // 已记录的字节数 (warmup 完成后 = PREDICTION_DELAY_STEPS)
+
+    // ==================== Task 2: PCA 集成状态 ====================
+    // PCA W 矩阵 CPU 镜像 [N_ASSOCIATION_NEURONS_2E × PCA_N_COMPONENTS]
+    // CPU 端 Oja 在线学习, 每 PCA_SYNC_INTERVAL 步同步到 GPU d_pca_W
+    std::vector<float> h_pca_W_;
+    // 联合皮层发放率快照 [N_ASSOCIATION_NEURONS_2E] (从 d_spike_flags 转换)
+    std::vector<float> h_fr_snapshot_;
+    // 联合皮层滑动平均发放率 [N_ASSOCIATION_NEURONS_2E] (PCA 中心化用)
+    std::vector<float> h_mean_fr_;
+    // spike_flags (bool) → float 转换用 host 中转缓冲 [N_ASSOCIATION_NEURONS_2E]
+    std::vector<uint8_t> h_spike_buf_;
+    // 滑动平均 EMA 系数 (越大越平滑, 0.99 = 时间常数 ~100 步)
+    float h_mean_fr_ema_ = 0.99f;
+    // PCA 更新次数计数 (每次 Oja 更新 +1, 供 FINAL_METRICS 输出)
+    int pca_update_count_ = 0;
+    // GPU 端 PCA 辅助缓冲 (compute_pca_signature / pca_back_project 用)
+    float* d_pca_fr_ = nullptr;      // [N_ASSOCIATION_NEURONS_2E] 当前发放率 (float)
+    float* d_pca_mean_ = nullptr;    // [N_ASSOCIATION_NEURONS_2E] 滑动平均发放率 GPU 镜像
+
+    // ==================== Task 4-5: 睡眠重放临时缓冲 ====================
+    float* d_replay_sig_ = nullptr;          // [PCA_N_COMPONENTS] 重放用签名临时缓冲
+    float* d_replay_recon_ = nullptr;        // [N_ASSOCIATION_NEURONS_2E] PCA 反投影重建临时缓冲
+    int replay_cycle_count_ = 0;             // 重放周期计数 (供 FINAL_METRICS 输出)
+
+    // ==================== Task 8: 结构可塑性临时缓冲 ====================
+    int* d_new_synapse_pairs_ = nullptr;     // [COACT_MAX_NEW_SYNAPSES × 2] 新突触对
+    int* d_new_synapse_count_ = nullptr;     // [1] 新突触计数
+    float* d_new_modulator_scores_ = nullptr;// [COACT_MAX_NEW_SYNAPSES] 调质分数
+    int* d_prune_marks_ = nullptr;           // [N_TOTAL_SYNAPSES_2E] 修剪标记
+    int* d_prune_count_ = nullptr;           // [1] 修剪计数
+    int structural_rebuild_count_ = 0;       // 结构重建次数计数
+    int coact_sample_count_ = 0;             // 共激活采样次数计数
+
+    // ==================== Task 18: 睡眠重放状态隔离 ====================
+    // 保存进入睡眠态前的 thalamic_gain (gate_mean_) 和 ach_level (stats_.ach_level)
+    // 重放期间 is_sleeping_=true, input_inject 步跳过外部字节注入,
+    // modulatory 步跳过 ACh 信号刷新 (让 ACh 自然保持低水平, 符合慢波睡眠生理特征)
+    float saved_thalamic_gain_ = 0.5f;       // 进入睡眠前保存的 gate_mean_ (默认 GATE_INITIAL_SIGNAL)
+    float saved_ach_level_     = 0.0f;       // 进入睡眠前保存的 stats_.ach_level
+    bool  is_sleeping_         = false;      // 睡眠态标志 (true=重放进行中, 外部输入已抑制)
+    int   sleep_cycle_count_   = 0;          // 睡眠周期计数 (供 FINAL_METRICS 输出)
+
+    // PCA 增量更新 (每 PCA_UPDATE_INTERVAL 步, CPU 端 Oja's rule)
+    void launch_pca_update_cpu(int step);
 
     // --- P1 占位 kernel 启动器 (中/慢时间尺度, Phase 2-4 实现) ---
     void launch_camkii_kernel(int step);

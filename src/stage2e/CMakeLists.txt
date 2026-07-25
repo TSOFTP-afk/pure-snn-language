@@ -61,7 +61,12 @@ set(STAGE2E_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/input_encoding.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/modulatory_kernels.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/coactivation_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/thalamic_gate.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/decode_kernels.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/pca_kernels.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/hippocampal_kernels.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/wm_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/run_config.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/scheduler_checkpoint.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp

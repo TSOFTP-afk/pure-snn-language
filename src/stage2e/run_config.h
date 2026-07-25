@@ -22,6 +22,10 @@ struct RunConfig {
     std::string csv_path;
     std::string checkpoint_dir = "checkpoints";
     std::string resume_path;
+    // Task 10: 在线解码评估参数
+    float decode_lr = 0.001f;           // 解码学习率 (传递给 scheduler, kernel 暂用编译常量)
+    bool eval_mode = false;             // 仅推理模式 (不更新 W_decode)
+    std::string eval_text_path;         // held-out 评估文本路径 (非空时用于评估)
 };
 
 bool parse_run_config(int argc, char** argv, RunConfig* config, std::string* error);

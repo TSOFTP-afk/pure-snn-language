@@ -353,4 +353,68 @@ bool import_delay_queue_state(const DelayQueueCheckpointState& state) {
                       sizeof(state.ring_counter_history), cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
+// =============================================================================
+// Task 7: 运动皮层 AdEx 更新 (复用 lif_adex_kernel)
+// =============================================================================
+// 运动皮层神经元 (d_motor_neurons, 5K) 使用与主网络相同的 AdEx 动力学更新。
+//   - 输入电流: 来自 launch_l5_to_motor_synapse 写入的 motor_input_current
+//     (通过 get_motor_input_current() 获取指针, 定义在 synapse_kernels.cu)
+//   - NMDA / 抑制电流: 简化为零缓冲 (运动皮层暂不实现 NMDA/抑制回路)
+//   - burst 计数: 内部静态计数器 (不暴露给 scheduler, 避免新增 checkpoint 字段)
+//
+// 静态零缓冲 (d_motor_zero_nmda / d_motor_zero_inh / d_motor_burst_counter)
+// 懒分配, 生命周期 = 程序 (与 d_delay_counters / d_motor_input_current 模式一致)
+// =============================================================================
+float* get_motor_input_current();  // forward decl from synapse_kernels.cuh
+
+namespace {
+float* d_motor_zero_nmda = nullptr;   // [N_MOTOR_NEURONS] 全零, 模拟无 NMDA 电流
+float* d_motor_zero_inh  = nullptr;   // [N_MOTOR_NEURONS] 全零, 模拟无抑制电流
+int*   d_motor_burst_counter = nullptr;  // [1] 运动皮层 burst 计数器 (内部诊断)
+
+inline void ensure_motor_zero_buffers() {
+    if (d_motor_zero_nmda == nullptr) {
+        CUDA_CHECK_2E(cudaMalloc(&d_motor_zero_nmda,
+                                  N_MOTOR_NEURONS * sizeof(float)));
+        CUDA_CHECK_2E(cudaMemset(d_motor_zero_nmda, 0,
+                                  N_MOTOR_NEURONS * sizeof(float)));
+        CUDA_CHECK_2E(cudaMalloc(&d_motor_zero_inh,
+                                  N_MOTOR_NEURONS * sizeof(float)));
+        CUDA_CHECK_2E(cudaMemset(d_motor_zero_inh, 0,
+                                  N_MOTOR_NEURONS * sizeof(float)));
+        CUDA_CHECK_2E(cudaMalloc(&d_motor_burst_counter, sizeof(int)));
+        CUDA_CHECK_2E(cudaMemset(d_motor_burst_counter, 0, sizeof(int)));
+    }
+}
+} // anonymous namespace
+
+void launch_motor_adex(MemoryAllocator* alloc, int step,
+                       const DevPhaseParams& phase) {
+    PersistentBuffers& b = alloc->buffers();
+    // 防御: 运动皮层神经元未分配时直接跳过
+    if (!b.d_motor_neurons || !b.d_motor_spike_flags) return;
+
+    ensure_motor_zero_buffers();
+    float* motor_input = get_motor_input_current();
+    // 若 L5→Motor 突触尚未调用 (motor_input == nullptr), 用零缓冲代替
+    if (motor_input == nullptr) motor_input = d_motor_zero_nmda;
+
+    // 每步清零 burst 计数器 (与主网络 d_single_neuron_burst_counter 一致的模式)
+    CUDA_CHECK_2E(cudaMemsetAsync(d_motor_burst_counter, 0, sizeof(int)));
+
+    int blocks = (N_MOTOR_NEURONS + THREADS_PER_BLOCK_2E - 1) / THREADS_PER_BLOCK_2E;
+    // 复用现有 lif_adex_kernel (定义在本文件上方)
+    lif_adex_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
+        b.d_motor_neurons,
+        b.d_motor_spike_flags,
+        motor_input,
+        d_motor_zero_nmda,
+        d_motor_zero_inh,
+        d_motor_burst_counter,
+        N_MOTOR_NEURONS,
+        step,
+        phase.plasticity_gain);
+    CUDA_CHECK_LAST_2E();
+}
+
 } // namespace stage2e

@@ -29,8 +29,9 @@
 #define N_COLUMNS_2E               50
 #define NEURONS_PER_COLUMN_2E      1000    // 联合皮层每柱 1000 神经经元
 #define N_PREFRONTAL_NEURONS       5000    // 独立前额叶 (50 组 × 100)
+#define N_MOTOR_NEURONS            5000    // 运动皮层神经元数 (50 群 × 100, 与柱数一致)
 #define N_ASSOCIATION_NEURONS_2E   (N_COLUMNS_2E * NEURONS_PER_COLUMN_2E)  // 50,000
-#define N_TOTAL_NEURONS_2E         (N_ASSOCIATION_NEURONS_2E + N_PREFRONTAL_NEURONS)  // 55,000
+#define N_TOTAL_NEURONS_2E         (N_ASSOCIATION_NEURONS_2E + N_PREFRONTAL_NEURONS + N_MOTOR_NEURONS)  // 60,000
 
 // 柱内四层皮层结构 (每柱 1000 = 200 L4 + 350 L2/3 + 200 L5 + 250 L6)
 // 对应 Phase R2 模块 C: 真实新皮层层级结构 (L4/L2-3/L5/L6)
@@ -47,12 +48,13 @@ static_assert(COL_L4_SIZE_2E + COL_L23_SIZE_2E + COL_L5_SIZE_2E + COL_L6_SIZE_2E
 #define N_L6_TOTAL_2E             (N_COLUMNS_2E * COL_L6_SIZE_2E)     // 12,500
 
 // region 枚举常量 (NeuronStateAdEx.region 字段语义, uint8_t)
-// 0=L4 (丘脑输入层), 1=L2/3 (整合+跨柱), 2=L5 (输出层), 3=L6 (丘脑反馈层), 4=前额叶
+// 0=L4 (丘脑输入层), 1=L2/3 (整合+跨柱), 2=L5 (输出层), 3=L6 (丘脑反馈层), 4=前额叶, 5=运动皮层
 #define REGION_L4                 0
 #define REGION_L23                1
 #define REGION_L5                 2
 #define REGION_L6                 3
 #define REGION_PREFRONTAL          4
+#define REGION_MOTOR              5
 
 // 突触预算 (v4: 10.7M, 80/20 兴奋/抑制)
 #define SYNAPSES_PER_NEURON_2E     200
@@ -339,18 +341,52 @@ enum class InhibitorySubtype : uint8_t {
 #define W_PRED_DIM                200      // 线性预测器维度
 #define TD_GAMMA                  0.9f
 #define ETA_VALUE                 0.001f
-#define ETA_PRED                  0.001f
+// P1.1 修复: ETA_PRED 从 0.001 → 0.005 (5 倍加速)
+// 原因: 0.001 时每步更新量级 ~2.7e-5, 40K 步仅 23.7% 非对角项突破零阈值
+//       spec 预期 50%+, 调至 0.005 后预期 40K 步达 60-70%
+// 仍保守以避免发散 (clamp 到 [-1,1] 兜底)
+#define ETA_PRED                  0.005f
 #define NOVELTY_EMA_BETA          0.99f
 #define DA_DOWNGRADE_THRESHOLD    5.0f     // |δ| 持续超此值触发降级
 
 // -----------------------------------------------------------------------------
-// 海马体索引 (v3 强化 C)
+// 海马体索引 (v3 强化 C, Task 3 海马编码 kernel)
 // -----------------------------------------------------------------------------
 #define HIPP_INDEX_SIZE           50000
 #define PATTERN_DIM               50       // v3: 10→50 维 PCA 签名
 #define HIPP_REPLAY_BATCH         200      // v3: 50→200
-#define HIPP_NOVELTY_THRESHOLD    0.5f
+// Task 3: 新颖性判定阈值 (语义为 cosine_similarity 阈值)
+//   PCA 签名已 L2 归一化 → cosine_similarity = 点积
+//   sim >= 阈值: 已有模式 (刷新 importance); sim < 阈值: 新颖模式 (写入 LRU 槽位)
+//   原 0.5 调整为 0.7 (Spec Task 3): 提高匹配严格度, 减少重复编码
+#define HIPP_NOVELTY_THRESHOLD    0.7f
 #define HIPP_REPLAY_DECAY         0.9f
+// P1.2 修复: 海马 importance 时间衰减系数
+// 原问题: importance 仅在重放时衰减, 40K 步仅 200 个模式被衰减一次, 其余 189 个保持 1.0
+//         导致 importance 分布过窄 (std=0.05, 集中在 [0.9,1.0]), LRU 失效
+// 修复: 每 HIPP_ENCODE_INTERVAL 步对所有索引执行 importance *= HIPP_TIME_DECAY
+//       0.9999^400 (40K步/100间隔) ≈ 0.96, 老模式自然衰减, 新模式重置为 1.0
+//       配合重放衰减 (0.9) 形成双时间尺度: 慢速时间衰减 + 快速重放衰减
+#define HIPP_TIME_DECAY           0.9995f
+// Task 3: 海马编码调用间隔 (步), 与 PCA_UPDATE_INTERVAL 一致
+//   每 100 步提取 PCA 签名并编码到海马索引表
+#define HIPP_ENCODE_INTERVAL      100
+
+// ==================== Task 4-5: 睡眠重放参数 ====================
+#define REPLAY_INTERVAL             10000    // 睡眠重放触发间隔 (步)
+#define REPLAY_WARMUP_STEPS         20000    // warmup: 步数 > 此值才触发重放
+#define REPLAY_INJECT_GAIN          2.0f     // 重放注入电流增益 (10x 速度的简化实现)
+#define REPLAY_LEARNING_RATE        0.01f    // 重放 STDP 巩固学习率 (预留, 当前简化版未使用)
+
+// Task 18: 睡眠态 ACh 衰减系数 (慢波睡眠期间 ACh 水平降低, 切换到巩固模式)
+// 生物学依据: 慢波睡眠时 ACh 水平降至清醒态的 ~30% (Hassani et al. 2009)
+// 实现方式: enter_sleep_state 保存当前 ach_level, 设置 ach_level *= SLEEP_ACH_FACTOR
+#define SLEEP_ACH_FACTOR            0.3f
+
+// Task 19: 结构重建 CSR 完整性校验开关
+// 重建后启动 csr_integrity_check_kernel 校验 row_ptr 单调性 + col_ind 范围 + 总数一致
+// 校验失败时从旧 CSR 副本回滚, 防止数据损坏
+#define CSR_INTEGRITY_CHECK_ENABLED 1        // 1=启用, 0=禁用
 
 // -----------------------------------------------------------------------------
 // 工作记忆 + 前额叶 (v3 强化 E)
@@ -360,11 +396,44 @@ enum class InhibitorySubtype : uint8_t {
 #define WM_DECAY_FACTOR           0.995f
 #define WM_ACTIVATION_THRESHOLD   0.3f
 
+// Task 9: WM 完整闭环参数 (新颖检测 + LRU 写入 + PCA 反投影注入)
+#define WM_NOVELTY_THRESHOLD      0.7f     // 新颖模式判定阈值 (cosine < 0.7 视为新颖)
+#define WM_INJECT_THRESHOLD       0.3f     // 注入触发阈值 (activation > 0.3 时注入前额叶)
+#define WM_DECAY                  0.995f   // 每步衰减因子 (与 WM_DECAY_FACTOR 一致, 新命名)
+#define WM_INJECT_GAIN            0.5f     // WM 注入前额叶的电流增益
+#define WM_WRITE_INTERVAL         100      // WM 写入间隔 (每 100 步计算 PCA 签名并匹配)
+
 // 前额叶分组
 #define PREFRONTAL_GROUPS         50
 #define NEURONS_PER_PF_GROUP      100      // 50 × 100 = 5000
 static_assert(PREFRONTAL_GROUPS * NEURONS_PER_PF_GROUP == N_PREFRONTAL_NEURONS,
               "prefrontal groups × neurons must equal N_PREFRONTAL_NEURONS");
+
+// -----------------------------------------------------------------------------
+// 语言运动皮层 (Stage 2e SNN, "语言运动皮层"基础设施)
+// -----------------------------------------------------------------------------
+// 运动皮层分组 (50 群 × 100 神经元 = 5000, 与柱数一致, 每群对应一个柱的 L5 输出)
+#define MOTOR_GROUP_SIZE              100      // 每运动群神经元数
+#define N_MOTOR_GROUPS                50       // 运动群数 (与柱数一致)
+static_assert(N_MOTOR_GROUPS * MOTOR_GROUP_SIZE == N_MOTOR_NEURONS,
+              "motor groups × neurons must equal N_MOTOR_NEURONS");
+
+// L5 → 运动皮层突触 (每个运动神经元接收 50 个来自对应柱 L5 层的兴奋性突触)
+// 总突触数 = N_MOTOR_NEURONS × L5_TO_MOTOR_SYNAPSES_PER_NEURON = 5000 × 50 = 250,000
+#define L5_TO_MOTOR_SYNAPSES_PER_NEURON  50
+
+// 解码权重学习率 (线性解码器从神经活动到 256 维字节 logits)
+#define DECODE_LEARNING_RATE         0.001f
+
+// perplexity 日志间隔 (步)
+#define PERPLEXITY_LOG_INTERVAL      1000
+
+// 预测延迟步数 (预测 t+PREDICTION_DELAY_STEPS 步之后的字节, 与 INPUT_INJECT_INTERVAL 一致)
+#define PREDICTION_DELAY_STEPS        3
+
+// DA (多巴胺) 基础浓度与增益 (用于运动皮层奖励调制)
+#define DA_BASE                       0.1f
+#define DA_GAIN                       0.5f
 
 // -----------------------------------------------------------------------------
 // 共激活跟踪 (v3 强化 D)
@@ -375,14 +444,42 @@ static_assert(PREFRONTAL_GROUPS * NEURONS_PER_PF_GROUP == N_PREFRONTAL_NEURONS,
 #define COACT_EVICT_STEPS         5000
 #define N_FORM_PER_CYCLE          5000
 
+// Task 6 共激活采样 kernel 专用参数 (与上述为别名关系, 统一命名)
+// 注: COACT_FORM_THRESHOLD (=5) 已在上面定义, 直接复用, 不重复 #define
+#define COACT_SAMPLE_SIZE         500      // 每步采样候选对数 (= COACT_K_SAMPLE)
+#define COACT_STALE_THRESHOLD     5000     // coact_count==0 持续此步数则淘汰 (= COACT_EVICT_STEPS)
+#define COACT_MAX_NEW_SYNAPSES    5000     // 每轮重建最多生成的新突触数 (= N_FORM_PER_CYCLE)
+// P2 修复: 共激活计数衰减系数
+// 原问题: coact_count > 0 的条目永不被淘汰, 40K 步后 500K 槽位 100% 饱和
+// 修复: 每 COACT_DECAY_INTERVAL 步对所有 tracker 执行 coact_count *= COACT_DECAY_FACTOR
+//       0.99^400 (40K步/100间隔) ≈ 0.018, 低频共激活对自然归零被淘汰
+//       高频共激活对 (每 100 步命中一次) 维持 coact_count > form_threshold
+#define COACT_DECAY_INTERVAL      100      // 衰减调用间隔 (步)
+#define COACT_DECAY_FACTOR        0.95f    // 每次衰减系数 (100步衰减5%)
+
+// -----------------------------------------------------------------------------
+// 结构可塑性 - 结构重建 (Task 7)
+// -----------------------------------------------------------------------------
+// 每 STRUCTURAL_REBUILD_INTERVAL 步触发一次结构重建:
+//   1. 共激活计数超阈值的候选对 → 生成新突触 (上限 COACT_MAX_NEW_SYNAPSES)
+//   2. |w| < PRUNE_WEIGHT_THRESHOLD 且 CaMKII 未巩固 (< 0.3) 的弱突触 → 修剪标记
+//   3. 总变更 (新增+修剪) > STRUCTURAL_CHANGE_THRESHOLD × 总突触数 → 执行 CSR 重建
+// 临时缓冲 (remap_table + new_row_ptr ≈ 43MB) 在重建后立即释放, 不常驻显存
+#define STRUCTURAL_REBUILD_INTERVAL  1000     // 结构重建周期 (步)
+#define PRUNE_WEIGHT_THRESHOLD       0.05f    // 修剪权重阈值: |w| < 此值且未巩固 → 修剪
+#define STRUCTURAL_CHANGE_THRESHOLD  0.05f    // 触发 CSR 重建的变更比例阈值 (5%)
+
 // -----------------------------------------------------------------------------
 // PCA 反投影 (v3 强化 A: 全量 GPU 矩阵)
 // -----------------------------------------------------------------------------
 #define PCA_SNAPSHOT_BUFFER       100
-#define PCA_UPDATE_INTERVAL       100      // 每 100 步增量更新
+#define PCA_UPDATE_INTERVAL       100      // 每 100 步增量更新 (Oja's rule)
 #define PCA_RETRAIN_INTERVAL      100000   // 每 100K 步全量重训
 #define PCA_ANCHOR_REFRESH        10000    // 每 10K 步刷新锚点
 #define PCA_LEARNING_RATE         0.01f
+#define PCA_WARMUP_STEPS          1000     // warmup 期不更新 W (等发放率稳定)
+#define PCA_N_COMPONENTS          50       // 主成分数 K (= PATTERN_DIM, 海马体签名维度)
+#define PCA_SYNC_INTERVAL         10000    // W 从 CPU 同步到 GPU 的间隔 (步)
 
 // -----------------------------------------------------------------------------
 // NMDA 钙浓度快照 (v3 强化 G)
