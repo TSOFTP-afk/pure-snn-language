@@ -335,10 +335,9 @@ BioMechanismScheduler::BioMechanismScheduler(MemoryAllocator* alloc)
     printf("[Stage2e P1] 调度器初始化完成\n");
     memset(&stats_, 0, sizeof(stats_));
     // 分配 device 端 spike 计数器
-    CUDA_CHECK_2E(cudaMalloc(&d_spike_counter_, sizeof(int)));
-    CUDA_CHECK_2E(cudaMemset(d_spike_counter_, 0, sizeof(int)));
-    CUDA_CHECK_2E(cudaMalloc(&d_single_neuron_burst_counter_, sizeof(int)));
-    CUDA_CHECK_2E(cudaMemset(d_single_neuron_burst_counter_, 0, sizeof(int)));
+    CUDA_CHECK_2E(cudaMalloc(&d_spike_counter_, 2 * sizeof(int)));
+    d_single_neuron_burst_counter_ = d_spike_counter_ + 1;
+    CUDA_CHECK_2E(cudaMemset(d_spike_counter_, 0, 2 * sizeof(int)));
     CUDA_CHECK_2E(cudaMalloc(&d_p3_column_spikes_, N_COLUMNS_2E * sizeof(int)));
     CUDA_CHECK_2E(cudaMemset(d_p3_column_spikes_, 0, N_COLUMNS_2E * sizeof(int)));
     CUDA_CHECK_2E(cudaMalloc(&d_p3_kwta_stats_, 3 * sizeof(int)));
@@ -382,7 +381,6 @@ BioMechanismScheduler::~BioMechanismScheduler() {
     printf("[Stage2e P1] 调度器销毁, 共执行 %d 步, 累计脉冲 %d\n",
            total_steps_, total_spikes_accum_);
     if (d_spike_counter_) cudaFree(d_spike_counter_);
-    if (d_single_neuron_burst_counter_) cudaFree(d_single_neuron_burst_counter_);
     if (d_p3_column_spikes_) cudaFree(d_p3_column_spikes_);
     if (d_p3_kwta_stats_) cudaFree(d_p3_kwta_stats_);
     if (d_p3_column_byte_responses_) cudaFree(d_p3_column_byte_responses_);
@@ -439,15 +437,6 @@ void BioMechanismScheduler::step(int current_step) {
                                  current_byte, is_inject_step,
                                  d_byte_history_, d_gate_stats_);
 
-    // Phase R2 模块 C (Task 6.5): 同步 L6 spike 总数到 host (用于 print_step_log)
-    {
-        std::vector<int> h_l6_col(N_COLUMNS_2E, 0);
-        cudaMemcpy(h_l6_col.data(), d_l6_column_spikes_,
-                   N_COLUMNS_2E * sizeof(int), cudaMemcpyDeviceToHost);
-        l6_total_spikes_last_ = 0;
-        for (int c = 0; c < N_COLUMNS_2E; ++c) l6_total_spikes_last_ += h_l6_col[c];
-    }
-
     // 2. 群体编码输入注入 (每 INPUT_INJECT_INTERVAL 步注入一个字节)
     // 门控调制增益: 传入 d_gate_states_ 数组, kernel 内部读取 .gate_signal 字段
     // (ThalamicGateState 是 16B 结构体, gate_signal 在 offset 0, 但相邻柱间隔 16B
@@ -457,7 +446,8 @@ void BioMechanismScheduler::step(int current_step) {
     }
 
     // 3. AdEx 神经元更新 (产生 spike_flags)
-    cudaMemsetAsync(d_single_neuron_burst_counter_, 0, sizeof(int));
+    // Both counters share one allocation; clear them with one launch.
+    cudaMemsetAsync(d_spike_counter_, 0, 2 * sizeof(int));
     launch_lif_adex(alloc_, current_step, phase, d_single_neuron_burst_counter_);
 
     // P2: 字节选择性直方图 (注入步统计 spike count per byte)
@@ -514,6 +504,17 @@ void BioMechanismScheduler::step(int current_step) {
     if (current_step % 1000 == 0) {
         launch_structural_plasticity(current_step);
         launch_developmental(current_step);
+        // L6 host totals are diagnostic-only and printed every 1000 steps.
+        // Avoid forcing a 200-byte device-to-host synchronization every step.
+        {
+            int h_l6_col[N_COLUMNS_2E]{};
+            cudaMemcpy(h_l6_col, d_l6_column_spikes_,
+                       sizeof(h_l6_col), cudaMemcpyDeviceToHost);
+            l6_total_spikes_last_ = 0;
+            for (int c = 0; c < N_COLUMNS_2E; ++c) {
+                l6_total_spikes_last_ += h_l6_col[c];
+            }
+        }
         // 丘脑门控统计: 从 device 拷贝到 host 缓存 (供 main.cpp 读取)
         cudaMemcpy(&gate_mean_, d_gate_stats_, sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(&gate_open_ratio_, d_gate_stats_ + 1, sizeof(float), cudaMemcpyDeviceToHost);
@@ -541,14 +542,13 @@ void BioMechanismScheduler::step(int current_step) {
 
     // ==================== 统计 ====================
     // 统计当前步 spike 数 (用于 P1 判据)
-    cudaMemsetAsync(d_spike_counter_, 0, sizeof(int));
     count_spikes_kernel<<<blocks, THREADS_PER_BLOCK_2E>>>(
         buf.d_spike_flags, N_TOTAL_NEURONS_2E, d_spike_counter_);
 
-    int step_spikes = 0;
-    cudaMemcpy(&step_spikes, d_spike_counter_, sizeof(int), cudaMemcpyDeviceToHost);
-    int step_single_burst = 0;
-    cudaMemcpy(&step_single_burst, d_single_neuron_burst_counter_, sizeof(int), cudaMemcpyDeviceToHost);
+    int h_step_counts[2] = {0, 0};
+    cudaMemcpy(h_step_counts, d_spike_counter_, sizeof(h_step_counts), cudaMemcpyDeviceToHost);
+    const int step_spikes = h_step_counts[0];
+    const int step_single_burst = h_step_counts[1];
 
     total_steps_++;
     total_spikes_accum_ += step_spikes;

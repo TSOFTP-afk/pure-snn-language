@@ -212,6 +212,10 @@ __global__ void delay_dispatch_kernel(
 // Host launchers
 // =============================================================================
 // 全局 device 计数器缓冲 (在首次调用时分配, 生命周期 = 程序)
+// Keep the 20 ring counters and 2 dispatch counters contiguous so the host
+// needs one synchronization/copy per step instead of an explicit device sync
+// followed by two small blocking copies.
+static int* d_delay_counters = nullptr;
 static int* d_ring_write_counter = nullptr;
 static int* d_dispatch_counts = nullptr;
 static int  h_ring_counter_history[DELAY_STEPS_MAX] = {0};
@@ -219,10 +223,10 @@ static DelayQueueRuntimeStats g_delay_stats = {0, 0, 0, 0, 0, 0, 0};
 
 static void ensure_counter_buffer() {
     if (d_ring_write_counter == nullptr) {
-        cudaMalloc(&d_ring_write_counter, DELAY_STEPS_MAX * sizeof(int));
-        cudaMemset(d_ring_write_counter, 0, DELAY_STEPS_MAX * sizeof(int));
-        cudaMalloc(&d_dispatch_counts, 2 * sizeof(int));
-        cudaMemset(d_dispatch_counts, 0, 2 * sizeof(int));
+        cudaMalloc(&d_delay_counters, (DELAY_STEPS_MAX + 2) * sizeof(int));
+        d_ring_write_counter = d_delay_counters;
+        d_dispatch_counts = d_delay_counters + DELAY_STEPS_MAX;
+        cudaMemset(d_delay_counters, 0, (DELAY_STEPS_MAX + 2) * sizeof(int));
         memset(h_ring_counter_history, 0, sizeof(h_ring_counter_history));
         memset(&g_delay_stats, 0, sizeof(g_delay_stats));
     }
@@ -282,14 +286,15 @@ void launch_delay_dispatch(MemoryAllocator* alloc, int step, int ring_idx) {
         N_TOTAL_NEURONS_2E,
         ring_idx);
 
-    // 同步 + 拷贝计数器回 host
-    cudaDeviceSynchronize();
-    cudaMemcpy(h_ring_counter_history, d_ring_write_counter,
-               DELAY_STEPS_MAX * sizeof(int), cudaMemcpyDeviceToHost);
+    // A blocking copy already synchronizes the default stream. Copy the
+    // contiguous ring + dispatch counters in one operation.
+    int h_delay_counters[DELAY_STEPS_MAX + 2]{};
+    cudaMemcpy(h_delay_counters, d_delay_counters,
+               sizeof(h_delay_counters), cudaMemcpyDeviceToHost);
+    memcpy(h_ring_counter_history, h_delay_counters,
+           sizeof(h_ring_counter_history));
 
-    int h_dispatch_counts[2] = {0, 0};
-    cudaMemcpy(h_dispatch_counts, d_dispatch_counts,
-               2 * sizeof(int), cudaMemcpyDeviceToHost);
+    const int* h_dispatch_counts = h_delay_counters + DELAY_STEPS_MAX;
     g_delay_stats.last_dispatched_events = h_dispatch_counts[0];
     g_delay_stats.last_dropped_events = h_dispatch_counts[1];
     g_delay_stats.dispatched_events += h_dispatch_counts[0];
